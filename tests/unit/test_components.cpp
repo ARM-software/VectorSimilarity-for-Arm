@@ -35,8 +35,14 @@ public:
         return this->dist_func(7);
     }
 
+    virtual DistType calcDistanceForQuery(const void *candidate_vector, const void *query_vector,
+                                          size_t dim) const {
+        return this->query_dist_func(7);
+    }
+
     // Dummy uses a non-standard dist func signature, so the standard slot is unavailable.
     spaces::dist_func_t<DistType> getDistFunc() const override { return nullptr; }
+    spaces::dist_func_t<DistType> getDistFuncForQuery() const override { return nullptr; }
 };
 
 } // namespace dummyCalcultor
@@ -50,6 +56,7 @@ TEST(IndexCalculatorTest, TestIndexCalculator) {
     auto distance_calculator = DistanceCalculatorDummy<DummyType>(allocator, dummyDistFunc);
 
     ASSERT_EQ(distance_calculator.calcDistance(nullptr, nullptr, 0), 7);
+    ASSERT_EQ(distance_calculator.calcDistanceForQuery(nullptr, nullptr, 0), 7);
 }
 
 class PreprocessorsTest : public ::testing::Test {};

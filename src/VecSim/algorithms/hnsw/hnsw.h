@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -555,7 +556,7 @@ void HNSWIndex<DataType, DistType>::processCandidate(
 
             elements_tags[candidate_id] = visited_tag;
 
-            DistType cur_dist = this->calcDistance(query_data, cur_data);
+            DistType cur_dist = this->calcDistanceForQuery(cur_data, query_data);
             if (lowerBound > cur_dist || top_candidates.size() < ef) {
 
                 candidate_set.emplace(-cur_dist, candidate_id);
@@ -583,7 +584,7 @@ void HNSWIndex<DataType, DistType>::processCandidate(
 
             elements_tags[candidate_id] = visited_tag;
 
-            DistType cur_dist = this->calcDistance(query_data, cur_data);
+            DistType cur_dist = this->calcDistanceForQuery(cur_data, query_data);
             if (lowerBound > cur_dist || top_candidates.size() < ef) {
                 candidate_set.emplace(-cur_dist, candidate_id);
 
@@ -640,7 +641,7 @@ void HNSWIndex<DataType, DistType>::processCandidate_RangeSearch(
 
             elements_tags[candidate_id] = visited_tag;
 
-            DistType cur_dist = this->calcDistance(query_data, cur_data);
+            DistType cur_dist = this->calcDistanceForQuery(cur_data, query_data);
             if (cur_dist < dyn_range) {
                 candidate_set.emplace(-cur_dist, candidate_id);
 
@@ -658,7 +659,7 @@ void HNSWIndex<DataType, DistType>::processCandidate_RangeSearch(
 
             elements_tags[candidate_id] = visited_tag;
 
-            DistType cur_dist = this->calcDistance(query_data, cur_data);
+            DistType cur_dist = this->calcDistanceForQuery(cur_data, query_data);
             if (cur_dist < dyn_range) {
                 candidate_set.emplace(-cur_dist, candidate_id);
 
@@ -685,7 +686,7 @@ HNSWIndex<DataType, DistType>::searchLayer(idType ep_id, const void *data_point,
 
     DistType lowerBound;
     if (!isMarkedDeleted(ep_id)) {
-        DistType dist = this->calcDistance(data_point, getDataByInternalId(ep_id));
+        DistType dist = this->calcDistanceForQuery(getDataByInternalId(ep_id), data_point);
         lowerBound = dist;
         top_candidates.emplace(dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
@@ -1229,7 +1230,7 @@ void HNSWIndex<DataType, DistType>::greedySearchLevel(const void *vector_data, s
             if (isInProcess(candidate)) {
                 continue;
             }
-            DistType d = this->calcDistance(vector_data, getDataByInternalId(candidate));
+            DistType d = this->calcDistanceForQuery(getDataByInternalId(candidate), vector_data);
             if (d < curDist) {
                 curDist = d;
                 bestCand = candidate;
@@ -1565,7 +1566,7 @@ void HNSWIndex<DataType, DistType>::insertElementToGraph(idType element_id,
     size_t max_common_level;
     if (element_max_level < global_max_level) {
         max_common_level = element_max_level;
-        cur_dist = this->calcDistance(vector_data, getDataByInternalId(curr_element));
+        cur_dist = this->calcDistanceForQuery(getDataByInternalId(curr_element), vector_data);
         for (auto level = static_cast<int>(global_max_level);
              level > static_cast<int>(element_max_level); level--) {
             // this is done for the levels which are above the max level
@@ -1885,7 +1886,7 @@ idType HNSWIndex<DataType, DistType>::searchBottomLayerEP(const void *query_data
     if (curr_element == INVALID_ID)
         return curr_element; // index is empty.
 
-    DistType cur_dist = this->calcDistance(query_data, getDataByInternalId(curr_element));
+    DistType cur_dist = this->calcDistanceForQuery(getDataByInternalId(curr_element), query_data);
     for (size_t level = max_level; level > 0 && curr_element != INVALID_ID; --level) {
         greedySearchLevel<true>(query_data, level, curr_element, cur_dist, timeoutCtx, rc);
     }
@@ -1908,7 +1909,7 @@ HNSWIndex<DataType, DistType>::searchBottomLayer_WithTimeout(idType ep_id, const
     if (!isMarkedDeleted(ep_id)) {
         // If ep is not marked as deleted, get its distance and set lower bound and heaps
         // accordingly
-        DistType dist = this->calcDistance(data_point, getDataByInternalId(ep_id));
+        DistType dist = this->calcDistanceForQuery(getDataByInternalId(ep_id), data_point);
         lowerBound = dist;
         top_candidates->emplace(dist, getExternalLabel(ep_id));
         candidate_set.emplace(-dist, ep_id);
@@ -2016,7 +2017,7 @@ VecSimQueryResultContainer HNSWIndex<DataType, DistType>::searchRangeBottomLayer
         dynamic_range_search_boundaries = dynamic_range = ep_dist;
     } else {
         // If ep is not marked as deleted, get its distance and set ranges accordingly
-        ep_dist = this->calcDistance(data_point, getDataByInternalId(ep_id));
+        ep_dist = this->calcDistanceForQuery(getDataByInternalId(ep_id), data_point);
         dynamic_range = ep_dist;
         if (ep_dist <= radius) {
             // Entry-point is within the radius - add it to the results.

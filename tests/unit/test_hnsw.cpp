@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -2247,4 +2248,317 @@ TYPED_TEST(HNSWTest, FitMemoryTest) {
     ASSERT_EQ(index->getAllocationSize(), initial_memory);
 
     VecSimIndex_Free(index);
+}
+
+/* ============================= SQ8 quantization tests ============================= */
+
+#include <unordered_set>
+
+// Helper: create an HNSW+SQ8 index.
+static VecSimIndex *CreateSQ8Index(VecSimType type, size_t dim, VecSimMetric metric,
+                                   void *quantParams = nullptr, bool is_multi = false,
+                                   size_t M = 16, size_t ef = 200) {
+    HNSWParams params{.type = type,
+                      .dim = dim,
+                      .metric = metric,
+                      .multi = is_multi,
+                      .M = M,
+                      .efConstruction = ef,
+                      .efRuntime = ef,
+                      .quantType = VecSimQuant_SQ8,
+                      .quantParams = quantParams};
+    VecSimParams vsp{.algo = VecSimAlgo_HNSWLIB, .algoParams = {.hnswParams = params}};
+    return VecSimIndex_New(&vsp);
+}
+
+TEST(HNSW_SQ8, HNSWParams_SQ8_Accepted) {
+    VecSimIndex *index = CreateSQ8Index(VecSimType_FLOAT32, 16, VecSimMetric_L2);
+    ASSERT_NE(index, nullptr);
+    VecSimIndex_Free(index);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_NullQuantParams) {
+    // null quantParams selects QuantPreprocessor + DistanceCalculatorCommon (no mean centering).
+    constexpr size_t dim = 16;
+    constexpr size_t n = 50;
+    VecSimIndex *index = CreateSQ8Index(VecSimType_FLOAT32, dim, VecSimMetric_L2, nullptr);
+    ASSERT_NE(index, nullptr);
+
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> data(n * dim);
+    for (float &v : data)
+        v = dist(rng);
+    for (size_t i = 0; i < n; ++i)
+        ASSERT_EQ(VecSimIndex_AddVector(index, data.data() + i * dim, (int)i), 1);
+
+    ASSERT_EQ(VecSimIndex_IndexSize(index), n);
+
+    VecSimQueryReply *reply = VecSimIndex_TopKQuery(index, data.data(), 5, nullptr, BY_ID);
+    ASSERT_NE(reply, nullptr);
+    ASSERT_EQ(VecSimQueryReply_Len(reply), 5u);
+    VecSimQueryReply_Free(reply);
+
+    VecSimIndex_Free(index);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_UnsupportedType) {
+    HNSWParams params{.type = VecSimType_INT8,
+                      .dim = 16,
+                      .metric = VecSimMetric_L2,
+                      .quantType = VecSimQuant_SQ8};
+    VecSimParams vsp{.algo = VecSimAlgo_HNSWLIB, .algoParams = {.hnswParams = params}};
+    VecSimIndex *index = VecSimIndex_New(&vsp);
+    ASSERT_EQ(index, nullptr);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_FP32_AddDeleteQuery) {
+    constexpr size_t dim = 16;
+    VecSimIndex *index = CreateSQ8Index(VecSimType_FLOAT32, dim, VecSimMetric_L2);
+    ASSERT_NE(index, nullptr);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 0u);
+
+    float v0[dim], v1[dim], v2[dim];
+    for (size_t i = 0; i < dim; ++i) {
+        v0[i] = (float)i;
+        v1[i] = (float)(i + 1);
+        v2[i] = (float)(i + 2);
+    }
+    ASSERT_EQ(VecSimIndex_AddVector(index, v0, 0), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, v1, 1), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, v2, 2), 1);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 3u);
+
+    ASSERT_EQ(VecSimIndex_DeleteVector(index, 1), 1);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 2u);
+
+    ASSERT_EQ(VecSimIndex_AddVector(index, v1, 1), 1);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 3u);
+
+    VecSimQueryReply *reply = VecSimIndex_TopKQuery(index, v1, 3, nullptr, BY_ID);
+    ASSERT_NE(reply, nullptr);
+    ASSERT_EQ(VecSimQueryReply_Len(reply), 3u);
+    VecSimQueryReply_Free(reply);
+
+    VecSimIndex_Free(index);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_FP16_AddDeleteQuery) {
+    constexpr size_t dim = 16;
+    VecSimIndex *index = CreateSQ8Index(VecSimType_FLOAT16, dim, VecSimMetric_L2);
+    ASSERT_NE(index, nullptr);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 0u);
+
+    std::vector<vecsim_types::float16> v0(dim), v1(dim), v2(dim);
+    for (size_t i = 0; i < dim; ++i) {
+        v0[i] = vecsim_types::FP32_to_FP16((float)i);
+        v1[i] = vecsim_types::FP32_to_FP16((float)(i + 1));
+        v2[i] = vecsim_types::FP32_to_FP16((float)(i + 2));
+    }
+    ASSERT_EQ(VecSimIndex_AddVector(index, v0.data(), 0), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, v1.data(), 1), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, v2.data(), 2), 1);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 3u);
+
+    ASSERT_EQ(VecSimIndex_DeleteVector(index, 1), 1);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 2u);
+
+    ASSERT_EQ(VecSimIndex_AddVector(index, v1.data(), 1), 1);
+    ASSERT_EQ(VecSimIndex_IndexSize(index), 3u);
+
+    VecSimQueryReply *reply = VecSimIndex_TopKQuery(index, v1.data(), 3, nullptr, BY_ID);
+    ASSERT_NE(reply, nullptr);
+    ASSERT_EQ(VecSimQueryReply_Len(reply), 3u);
+    VecSimQueryReply_Free(reply);
+
+    VecSimIndex_Free(index);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_TopKQuery_Recall) {
+    constexpr size_t dim = 128;
+    constexpr size_t n = 1000;
+    constexpr size_t k = 10;
+    constexpr float recall_threshold = 0.9f;
+
+    VecSimIndex *index = CreateSQ8Index(VecSimType_FLOAT32, dim, VecSimMetric_L2);
+    ASSERT_NE(index, nullptr);
+
+    BFParams bfParams{.type = VecSimType_FLOAT32, .dim = dim, .metric = VecSimMetric_L2};
+    VecSimParams bfVsp{.algo = VecSimAlgo_BF, .algoParams = {.bfParams = bfParams}};
+    VecSimIndex *bf_index = VecSimIndex_New(&bfVsp);
+    ASSERT_NE(bf_index, nullptr);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> data(n * dim);
+    for (float &v : data)
+        v = dist(rng);
+    for (size_t i = 0; i < n; ++i) {
+        VecSimIndex_AddVector(index, data.data() + i * dim, i);
+        VecSimIndex_AddVector(bf_index, data.data() + i * dim, i);
+    }
+
+    constexpr size_t n_queries = 10;
+    size_t total_hits = 0;
+    for (size_t q = 0; q < n_queries; ++q) {
+        std::vector<float> query(dim);
+        for (float &v : query)
+            v = dist(rng);
+
+        VecSimQueryReply *hnsw_res = VecSimIndex_TopKQuery(index, query.data(), k, nullptr, BY_ID);
+        VecSimQueryReply *bf_res = VecSimIndex_TopKQuery(bf_index, query.data(), k, nullptr, BY_ID);
+
+        ASSERT_EQ(VecSimQueryReply_Len(hnsw_res), k);
+        ASSERT_EQ(VecSimQueryReply_Len(bf_res), k);
+
+        std::unordered_set<size_t> gt;
+        auto *it = VecSimQueryReply_GetIterator(bf_res);
+        while (VecSimQueryReply_IteratorHasNext(it))
+            gt.insert(VecSimQueryResult_GetId(VecSimQueryReply_IteratorNext(it)));
+        VecSimQueryReply_IteratorFree(it);
+
+        it = VecSimQueryReply_GetIterator(hnsw_res);
+        while (VecSimQueryReply_IteratorHasNext(it)) {
+            if (gt.count(VecSimQueryResult_GetId(VecSimQueryReply_IteratorNext(it))))
+                ++total_hits;
+        }
+        VecSimQueryReply_IteratorFree(it);
+
+        VecSimQueryReply_Free(hnsw_res);
+        VecSimQueryReply_Free(bf_res);
+    }
+
+    float recall = (float)total_hits / (float)(n_queries * k);
+    ASSERT_GE(recall, recall_threshold) << "recall=" << recall;
+
+    VecSimIndex_Free(bf_index);
+    VecSimIndex_Free(index);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_RangeQuery) {
+    constexpr size_t dim = 16;
+    constexpr size_t n = 500;
+
+    VecSimIndex *index = CreateSQ8Index(VecSimType_FLOAT32, dim, VecSimMetric_L2);
+    ASSERT_NE(index, nullptr);
+
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    std::vector<float> data(n * dim);
+    for (float &v : data)
+        v = dist(rng);
+    for (size_t i = 0; i < n; ++i)
+        VecSimIndex_AddVector(index, data.data() + i * dim, i);
+
+    const float *query = data.data();
+    double radius = 4.0;
+
+    VecSimQueryReply *reply = VecSimIndex_RangeQuery(index, query, radius, nullptr, BY_ID);
+    ASSERT_NE(reply, nullptr);
+    ASSERT_GT(VecSimQueryReply_Len(reply), 0u);
+
+    auto *it = VecSimQueryReply_GetIterator(reply);
+    while (VecSimQueryReply_IteratorHasNext(it)) {
+        VecSimQueryResult *r = VecSimQueryReply_IteratorNext(it);
+        ASSERT_LE(VecSimQueryResult_GetScore(r), radius);
+    }
+    VecSimQueryReply_IteratorFree(it);
+    VecSimQueryReply_Free(reply);
+
+    VecSimIndex_Free(index);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_BatchIterator) {
+    constexpr size_t dim = 16;
+    constexpr size_t n = 200;
+    constexpr size_t k = 50;
+
+    VecSimIndex *index = CreateSQ8Index(VecSimType_FLOAT32, dim, VecSimMetric_L2);
+    ASSERT_NE(index, nullptr);
+
+    std::mt19937 rng(13);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    std::vector<float> data(n * dim);
+    for (float &v : data)
+        v = dist(rng);
+    for (size_t i = 0; i < n; ++i)
+        VecSimIndex_AddVector(index, data.data() + i * dim, i);
+
+    std::vector<float> query(dim);
+    for (float &v : query)
+        v = dist(rng);
+
+    VecSimBatchIterator *bit = VecSimBatchIterator_New(index, query.data(), nullptr);
+    ASSERT_NE(bit, nullptr);
+
+    std::unordered_set<size_t> seen;
+    size_t total = 0;
+    constexpr size_t batch = 10;
+
+    while (VecSimBatchIterator_HasNext(bit) && total < k) {
+        VecSimQueryReply *rep = VecSimBatchIterator_Next(bit, batch, BY_ID);
+        ASSERT_NE(rep, nullptr);
+        size_t got = VecSimQueryReply_Len(rep);
+
+        auto *rit = VecSimQueryReply_GetIterator(rep);
+        while (VecSimQueryReply_IteratorHasNext(rit)) {
+            size_t label = VecSimQueryResult_GetId(VecSimQueryReply_IteratorNext(rit));
+            ASSERT_EQ(seen.count(label), 0u) << "Duplicate label " << label;
+            seen.insert(label);
+        }
+        VecSimQueryReply_IteratorFree(rit);
+        VecSimQueryReply_Free(rep);
+        total += got;
+    }
+    ASSERT_GT(total, 0u);
+
+    VecSimBatchIterator_Free(bit);
+    VecSimIndex_Free(index);
+}
+
+TEST(HNSW_SQ8, HNSW_SQ8_SizeEstimates) {
+    // For dim=128:
+    //   FP32:            128*4 = 512 bytes stored per element
+    //   SQ8 no mean, L2: 128 + 4*4 = 144 bytes (storage_metadata_count<L2> = 4)
+    //   SQ8 with mean, L2: 128 + 5*4 = 148 bytes (storage_metadata_count_with_norm<L2> = 5)
+    constexpr size_t dim = 128;
+
+    HNSWParams fp32_params{
+        .type = VecSimType_FLOAT32, .dim = dim, .metric = VecSimMetric_L2, .M = 16};
+    // null quantParams → no-mean path
+    HNSWParams sq8_no_mean_params{.type = VecSimType_FLOAT32,
+                                  .dim = dim,
+                                  .metric = VecSimMetric_L2,
+                                  .M = 16,
+                                  .quantType = VecSimQuant_SQ8};
+    // non-null quantParams → with-mean path
+    float fake_mean[dim] = {};
+    HNSWParams sq8_with_mean_params{.type = VecSimType_FLOAT32,
+                                    .dim = dim,
+                                    .metric = VecSimMetric_L2,
+                                    .M = 16,
+                                    .quantType = VecSimQuant_SQ8,
+                                    .quantParams = fake_mean};
+
+    VecSimParams fp32_vsp{.algo = VecSimAlgo_HNSWLIB, .algoParams = {.hnswParams = fp32_params}};
+    VecSimParams sq8_no_mean_vsp{.algo = VecSimAlgo_HNSWLIB,
+                                 .algoParams = {.hnswParams = sq8_no_mean_params}};
+    VecSimParams sq8_with_mean_vsp{.algo = VecSimAlgo_HNSWLIB,
+                                   .algoParams = {.hnswParams = sq8_with_mean_params}};
+
+    ASSERT_GT(VecSimIndex_EstimateInitialSize(&sq8_no_mean_vsp), 0u);
+    ASSERT_GT(VecSimIndex_EstimateElementSize(&sq8_no_mean_vsp), 0u);
+
+    // SQ8 (both paths) blobs are smaller than FP32 for large dimensions.
+    ASSERT_LT(VecSimIndex_EstimateElementSize(&sq8_no_mean_vsp),
+              VecSimIndex_EstimateElementSize(&fp32_vsp));
+    ASSERT_LT(VecSimIndex_EstimateElementSize(&sq8_with_mean_vsp),
+              VecSimIndex_EstimateElementSize(&fp32_vsp));
+
+    // With-mean path stores one extra float (mean_ip) per blob compared to no-mean.
+    ASSERT_LT(VecSimIndex_EstimateElementSize(&sq8_no_mean_vsp),
+              VecSimIndex_EstimateElementSize(&sq8_with_mean_vsp));
 }

@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -17,6 +18,7 @@
 
 using bfloat16 = vecsim_types::bfloat16;
 using float16 = vecsim_types::float16;
+using sq8 = vecsim_types::sq8;
 
 namespace HNSWFactory {
 
@@ -34,8 +36,116 @@ NewIndex_ChooseMultiOrSingle(const HNSWParams *params,
             HNSWIndex_Single<DataType, DistType>(params, abstractInitParams, components);
 }
 
+// Helper to build an SQ8-quantized HNSW index given compile-time DataType and Metric.
+template <typename DataType, VecSimMetric Metric>
+VecSimIndex *NewIndex_SQ8(const HNSWParams *hnswParams,
+                          const AbstractIndexInitParams &abstractInitParams,
+                          const float *mean_ptr) {
+    auto &allocator = abstractInitParams.allocator;
+    size_t dim = abstractInitParams.dim;
+    unsigned char alignment = 0;
+
+    // Symmetric: both stored vectors are SQ8 blobs.
+    auto sym_func = spaces::GetDistFunc<sq8, float>(Metric, dim, &alignment);
+    // Asymmetric: stored vector is SQ8 blob, query is DataType.
+    auto asym_func = spaces::GetDistFunc<sq8, float, DataType>(Metric, dim, &alignment);
+
+    if (mean_ptr == nullptr) {
+        // No mean vector: plain SQ8 quantization without mean centering.
+        auto *pp = new (allocator) QuantPreprocessor<DataType, Metric>(allocator, dim);
+        auto *container =
+            new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
+        int ret = container->addPreprocessor(pp);
+        assert(ret == 0 && "SQ8 preprocessor was not added correctly");
+        UNUSED(ret);
+
+        // sym_func for storage-storage; asym_func for query-storage.
+        auto *calc =
+            new (allocator) DistanceCalculatorCommon<float>(allocator, sym_func, asym_func);
+
+        IndexComponents<DataType, float> components{calc, container};
+        return NewIndex_ChooseMultiOrSingle<DataType, float>(hnswParams, abstractInitParams,
+                                                             components);
+    } else {
+        // With mean vector: mean-centered SQ8 quantization with norm correction.
+        vecsim_stl::vector<float> mean_vec(dim, 0.0f, allocator);
+        memcpy(mean_vec.data(), mean_ptr, dim * sizeof(float));
+
+        float mean_sum_squares = 0.0f;
+        for (float v : mean_vec) {
+            mean_sum_squares += v * v;
+        }
+
+        auto *pp =
+            new (allocator) QuantPreprocessor<DataType, Metric, true>(allocator, dim, mean_vec);
+        auto *container =
+            new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
+        int ret = container->addPreprocessor(pp);
+        assert(ret == 0 && "SQ8 preprocessor was not added correctly");
+        UNUSED(ret);
+
+        auto *calc = new (allocator) DistanceCalculatorWithNorm<DataType, float, Metric>(
+            allocator, asym_func, sym_func, mean_sum_squares);
+
+        IndexComponents<DataType, float> components{calc, container};
+        return NewIndex_ChooseMultiOrSingle<DataType, float>(hnswParams, abstractInitParams,
+                                                             components);
+    }
+}
+
 VecSimIndex *NewIndex(const VecSimParams *params, bool is_normalized) {
     const HNSWParams *hnswParams = &params->algoParams.hnswParams;
+
+    if (hnswParams->quantType == VecSimQuant_SQ8) {
+        if (hnswParams->type != VecSimType_FLOAT32 && hnswParams->type != VecSimType_FLOAT16) {
+            return NULL; // SQ8 supports FP32 and FP16 only.
+        }
+        if (!is_normalized && hnswParams->metric == VecSimMetric_Cosine) {
+            return NULL; // Standalone SQ8 does not support cosine metric.
+        }
+
+        AbstractIndexInitParams abstractInitParams =
+            VecSimFactory::NewAbstractInitParams(hnswParams, params->logCtx, is_normalized);
+
+        const float *mean_ptr = static_cast<const float *>(hnswParams->quantParams);
+        size_t dim = hnswParams->dim;
+        VecSimMetric metric = hnswParams->metric;
+        if (is_normalized && metric == VecSimMetric_Cosine) {
+            metric = VecSimMetric_IP;
+        }
+
+        // Override blob sizes for the SQ8 storage layout.
+        if (metric == VecSimMetric_L2) {
+            abstractInitParams.storedDataSize =
+                dim + (mean_ptr ? sq8::storage_metadata_count<VecSimMetric_L2, true>()
+                                : sq8::storage_metadata_count<VecSimMetric_L2, false>()) *
+                          sizeof(float);
+        } else {
+            abstractInitParams.storedDataSize =
+                dim + (mean_ptr ? sq8::storage_metadata_count<VecSimMetric_IP, true>()
+                                : sq8::storage_metadata_count<VecSimMetric_IP, false>()) *
+                          sizeof(float);
+        }
+
+        if (hnswParams->type == VecSimType_FLOAT32) {
+            if (metric == VecSimMetric_L2) {
+                return NewIndex_SQ8<float, VecSimMetric_L2>(hnswParams, abstractInitParams,
+                                                            mean_ptr);
+            } else {
+                return NewIndex_SQ8<float, VecSimMetric_IP>(hnswParams, abstractInitParams,
+                                                            mean_ptr);
+            }
+        } else { // FLOAT16
+            if (metric == VecSimMetric_L2) {
+                return NewIndex_SQ8<float16, VecSimMetric_L2>(hnswParams, abstractInitParams,
+                                                              mean_ptr);
+            } else {
+                return NewIndex_SQ8<float16, VecSimMetric_IP>(hnswParams, abstractInitParams,
+                                                              mean_ptr);
+            }
+        }
+    }
+
     AbstractIndexInitParams abstractInitParams =
         VecSimFactory::NewAbstractInitParams(hnswParams, params->logCtx, is_normalized);
 
@@ -94,7 +204,27 @@ size_t EstimateInitialSize(const HNSWParams *params, bool is_normalized) {
     size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
 
     size_t est = sizeof(VecSimAllocator) + allocations_overhead;
-    if (params->type == VecSimType_FLOAT32) {
+
+    if (params->quantType == VecSimQuant_SQ8) {
+        if (params->type != VecSimType_FLOAT32 && params->type != VecSimType_FLOAT16) {
+            throw std::invalid_argument("Invalid params->type for VecSimQuant_SQ8");
+        }
+        // Calculator + preprocessor container + preprocessor.
+        // Use representative types; sizeof is independent of the template parameters.
+        if (params->quantParams) { // mean provided, WithNorm = true
+            est += allocations_overhead +
+                   sizeof(DistanceCalculatorWithNorm<float, float, VecSimMetric_L2>);
+            est += allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>);
+            est += allocations_overhead + sizeof(QuantPreprocessor<float, VecSimMetric_L2, true>);
+            est += allocations_overhead +
+                   params->dim * sizeof(float); // mean vector in QuantPreprocessor
+        } else {
+            est += allocations_overhead + sizeof(DistanceCalculatorCommon<float>);
+            est += allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>);
+            est += allocations_overhead + sizeof(QuantPreprocessor<float, VecSimMetric_L2>);
+        }
+        est += EstimateInitialSize_ChooseMultiOrSingle<float>(params->multi);
+    } else if (params->type == VecSimType_FLOAT32) {
         est += EstimateComponentsMemory<float, float>(params->metric, is_normalized);
         est += EstimateInitialSize_ChooseMultiOrSingle<float>(params->multi);
     } else if (params->type == VecSimType_FLOAT64) {
@@ -125,9 +255,25 @@ size_t EstimateElementSize(const HNSWParams *params) {
     size_t M = (params->M) ? params->M : HNSW_DEFAULT_M;
     size_t elementGraphDataSize = sizeof(ElementGraphData) + sizeof(idType) * M * 2;
 
-    size_t size_total_data_per_element =
-        elementGraphDataSize +
-        VecSimParams_GetStoredDataSize(params->type, params->dim, params->metric);
+    size_t stored_data_size;
+    if (params->quantType == VecSimQuant_SQ8) {
+        size_t meta_count;
+        if (params->metric == VecSimMetric_L2) {
+            meta_count = params->quantParams
+                             ? sq8::storage_metadata_count<VecSimMetric_L2, true>()
+                             : sq8::storage_metadata_count<VecSimMetric_L2, false>();
+        } else {
+            meta_count = params->quantParams
+                             ? sq8::storage_metadata_count<VecSimMetric_IP, true>()
+                             : sq8::storage_metadata_count<VecSimMetric_IP, false>();
+        }
+        stored_data_size = params->dim + meta_count * sizeof(float);
+    } else {
+        stored_data_size =
+            VecSimParams_GetStoredDataSize(params->type, params->dim, params->metric);
+    }
+
+    size_t size_total_data_per_element = elementGraphDataSize + stored_data_size;
 
     // when reserving space for new labels in the lookup hash table, each entry is a pointer to a
     // label node (bucket).

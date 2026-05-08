@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -1090,9 +1091,9 @@ TEST(PreprocessorsTest, QuantizationTest) {
                                                         expected_storage_blob,
                                                         quantized_blob_bytes_count));
 #if !defined(NDEBUG)
-        EXPECT_EXIT(
-            { multiPPContainer.preprocessStorageInPlace(buffer, sizeof(uint8_t)); },
-            testing::KilledBySignal(SIGABRT), "Input buffer too small for in-place quantization");
+        EXPECT_EXIT({ multiPPContainer.preprocessStorageInPlace(buffer, sizeof(uint8_t)); },
+                    testing::KilledBySignal(SIGABRT),
+                    "Input buffer too small for in-place quantization");
 #endif
     }
 }
@@ -1509,3 +1510,363 @@ TEST(QuantPreprocessorFP16Test, QuantizeReconstructRoundTripL2) {
     allocator->free_allocation(storage_blob);
     delete preprocessor;
 }
+
+// Parameterized test class for QuantPreprocessor<float, *, WithNorm=true>.
+// Covers L2 and IP metrics (Cosine is rejected by static_assert at compile time).
+// Verifies that:
+//   - Storage quantization operates on mean-subtracted (centered) values.
+//   - x_mean_ip = Σ(original_i * mean_i) is appended as extra storage metadata.
+//   - Query body contains the ORIGINAL (non-centered) values.
+//   - Query metadata contains y_sum, (y_sum_squares for L2), and y_mean_ip.
+class QuantPreprocessorWithNormMetricTest : public testing::TestWithParam<VecSimMetric> {
+protected:
+    static constexpr size_t dim = 5;
+    static constexpr unsigned char alignment = 0;
+    static constexpr size_t original_blob_size = dim * sizeof(float);
+
+    std::shared_ptr<VecSimAllocator> allocator;
+    float original_blob[dim] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+    float mean_vec[dim] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f};
+    float centered[dim]; // original_blob[i] - mean_vec[i]
+
+    void SetUp() override {
+        allocator = VecSimAllocator::newVecsimAllocator();
+        for (size_t i = 0; i < dim; ++i) {
+            centered[i] = original_blob[i] - mean_vec[i];
+        }
+    }
+
+    template <VecSimMetric Metric>
+    size_t getExpectedStorageSize() const {
+        return dim * sizeof(uint8_t) +
+               sq8::storage_metadata_count_with_norm<Metric>() * sizeof(float);
+    }
+
+    template <VecSimMetric Metric>
+    size_t getExpectedQuerySize() const {
+        return dim * sizeof(float) + sq8::query_metadata_count_with_norm<Metric>() * sizeof(float);
+    }
+
+    template <VecSimMetric Metric>
+    void runQuantizationTest() {
+        const size_t expected_storage_size = getExpectedStorageSize<Metric>();
+        const size_t expected_query_size = getExpectedQuerySize<Metric>();
+
+        // Compute expected storage: quantization is over centered values.
+        constexpr size_t max_storage_baseline = dim * sizeof(uint8_t) + 4 * sizeof(float);
+        uint8_t expected_storage_blob[max_storage_baseline];
+        ComputeSQ8Quantization(centered, dim, expected_storage_blob);
+
+        // Expected extra storage metadata: x_mean_ip = Σ(original[i] * mean[i])
+        float expected_x_mean_ip = 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            expected_x_mean_ip += original_blob[i] * mean_vec[i];
+        }
+
+        // Expected query metadata (over original, not centered, values)
+        float expected_y_sum = 0.0f;
+        float expected_y_sum_squares = 0.0f;
+        float expected_y_mean_ip = 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            expected_y_sum += original_blob[i];
+            expected_y_sum_squares += original_blob[i] * original_blob[i];
+            expected_y_mean_ip += original_blob[i] * mean_vec[i];
+        }
+
+        vecsim_stl::vector<float> mean_vector(allocator);
+        for (size_t i = 0; i < dim; ++i) {
+            mean_vector.push_back(mean_vec[i]);
+        }
+        auto quant_preprocessor =
+            new (allocator) QuantPreprocessor<float, Metric, true>(allocator, dim, mean_vector);
+
+        // Test preprocess (both storage and query)
+        {
+            void *storage_blob = nullptr;
+            void *query_blob = nullptr;
+            size_t storage_blob_size = original_blob_size;
+            size_t query_blob_size = original_blob_size;
+
+            quant_preprocessor->preprocess(original_blob, storage_blob, query_blob,
+                                           storage_blob_size, query_blob_size, alignment);
+
+            ASSERT_NE(storage_blob, nullptr);
+            ASSERT_EQ(storage_blob_size, expected_storage_size);
+            ASSERT_NE(query_blob, nullptr);
+            ASSERT_EQ(query_blob_size, expected_query_size);
+
+            // Verify quantized values + common metadata match centered baseline.
+            // Exclude x_mean_ip (last extra float) from comparison.
+            const size_t compare_size = (Metric == VecSimMetric_L2)
+                                            ? dim * sizeof(uint8_t) + 4 * sizeof(float)
+                                            : dim * sizeof(uint8_t) + 3 * sizeof(float);
+            EXPECT_NO_FATAL_FAILURE(CompareVectors<uint8_t>(
+                static_cast<const uint8_t *>(storage_blob), expected_storage_blob, compare_size));
+
+            // Verify x_mean_ip at its index in the storage metadata region
+            const float *storage_meta =
+                reinterpret_cast<const float *>(static_cast<const uint8_t *>(storage_blob) + dim);
+            ASSERT_FLOAT_EQ(storage_meta[sq8::mean_ip_index<Metric>()], expected_x_mean_ip);
+
+            // Query body must be the ORIGINAL (not centered) values
+            const float *query_floats = static_cast<const float *>(query_blob);
+            EXPECT_NO_FATAL_FAILURE(CompareVectors<float>(query_floats, original_blob, dim));
+
+            // Query metadata
+            ASSERT_FLOAT_EQ(query_floats[dim + sq8::SUM_QUERY], expected_y_sum);
+            if constexpr (Metric == VecSimMetric_L2) {
+                ASSERT_FLOAT_EQ(query_floats[dim + sq8::SUM_SQUARES_QUERY], expected_y_sum_squares);
+            }
+            ASSERT_FLOAT_EQ(query_floats[dim + sq8::query_mean_ip_index<Metric>()],
+                            expected_y_mean_ip);
+
+            allocator->free_allocation(storage_blob);
+            allocator->free_allocation(query_blob);
+        }
+
+        // Test preprocessForStorage
+        {
+            void *blob = nullptr;
+            size_t blob_size = original_blob_size;
+            quant_preprocessor->preprocessForStorage(original_blob, blob, blob_size);
+            ASSERT_NE(blob, nullptr);
+            ASSERT_EQ(blob_size, expected_storage_size);
+            allocator->free_allocation(blob);
+        }
+
+        // Test preprocessQuery
+        {
+            void *blob = nullptr;
+            size_t blob_size = original_blob_size;
+            quant_preprocessor->preprocessQuery(original_blob, blob, blob_size, alignment);
+            ASSERT_NE(blob, nullptr);
+            ASSERT_EQ(blob_size, expected_query_size);
+
+            const float *query_floats = static_cast<const float *>(blob);
+            EXPECT_NO_FATAL_FAILURE(CompareVectors<float>(query_floats, original_blob, dim));
+            ASSERT_FLOAT_EQ(query_floats[dim + sq8::SUM_QUERY], expected_y_sum);
+            if constexpr (Metric == VecSimMetric_L2) {
+                ASSERT_FLOAT_EQ(query_floats[dim + sq8::SUM_SQUARES_QUERY], expected_y_sum_squares);
+            }
+            ASSERT_FLOAT_EQ(query_floats[dim + sq8::query_mean_ip_index<Metric>()],
+                            expected_y_mean_ip);
+            allocator->free_allocation(blob);
+        }
+
+        delete quant_preprocessor;
+    }
+};
+
+TEST_P(QuantPreprocessorWithNormMetricTest, QuantizationBlobSizeAndMetadata) {
+    VecSimMetric metric = GetParam();
+    switch (metric) {
+    case VecSimMetric_L2:
+        runQuantizationTest<VecSimMetric_L2>();
+        break;
+    case VecSimMetric_IP:
+        runQuantizationTest<VecSimMetric_IP>();
+        break;
+    default:
+        FAIL() << "Unexpected metric (Cosine is rejected by static_assert for WithNorm=true)";
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(QuantPreprocessorWithNormTests, QuantPreprocessorWithNormMetricTest,
+                         testing::Values(VecSimMetric_L2, VecSimMetric_IP),
+                         [](const testing::TestParamInfo<VecSimMetric> &info) {
+                             return VecSimMetric_ToString(info.param);
+                         });
+
+// Parameterized test class for QuantPreprocessor<float16, *, WithNorm=true>.
+// Storage = [uint8*dim][float*(N+1)], query = [float16*dim][float*(M+1)].
+// The extra float slot in each blob holds mean_ip / y_mean_ip respectively.
+class QuantPreprocessorFP16WithNormMetricTest : public testing::TestWithParam<VecSimMetric> {
+protected:
+    using float16 = vecsim_types::float16;
+    static constexpr size_t dim = 5;
+    static constexpr unsigned char alignment = 0;
+    static constexpr size_t original_blob_size = dim * sizeof(float16);
+
+    std::shared_ptr<VecSimAllocator> allocator;
+    float16 original_blob[dim];
+    float widened_blob[dim]; // FP16 input widened to FP32 for baseline arithmetic
+    float mean_f32[dim] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f};
+
+    void SetUp() override {
+        allocator = VecSimAllocator::newVecsimAllocator();
+        const float src[dim] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+        for (size_t i = 0; i < dim; ++i) {
+            original_blob[i] = vecsim_types::FP32_to_FP16(src[i]);
+            widened_blob[i] = vecsim_types::FP16_to_FP32(original_blob[i]);
+        }
+    }
+
+    // Reads an FP32 scalar at a given byte offset via memcpy to handle potential misalignment.
+    static float load_meta(const void *base, size_t byte_offset) {
+        float v;
+        std::memcpy(&v, static_cast<const uint8_t *>(base) + byte_offset, sizeof(float));
+        return v;
+    }
+
+    template <VecSimMetric Metric>
+    size_t getExpectedStorageSize() const {
+        return dim * sizeof(uint8_t) +
+               sq8::storage_metadata_count_with_norm<Metric>() * sizeof(float);
+    }
+
+    template <VecSimMetric Metric>
+    size_t getExpectedQuerySize() const {
+        return dim * sizeof(float16) +
+               sq8::query_metadata_count_with_norm<Metric>() * sizeof(float);
+    }
+
+    template <VecSimMetric Metric>
+    void runQuantizationTest() {
+        const size_t expected_storage_size = getExpectedStorageSize<Metric>();
+        const size_t expected_query_size = getExpectedQuerySize<Metric>();
+        const size_t storage_meta_offset = dim * sizeof(uint8_t);
+        const size_t query_meta_offset = dim * sizeof(float16);
+
+        // Compute centered baseline: widened FP16 values minus mean
+        float centered[dim];
+        for (size_t i = 0; i < dim; ++i) {
+            centered[i] = widened_blob[i] - mean_f32[i];
+        }
+
+        // FP32 baseline quantization on centered values
+        constexpr size_t max_storage_baseline = dim * sizeof(uint8_t) + 4 * sizeof(float);
+        uint8_t baseline_storage[max_storage_baseline];
+        ComputeSQ8Quantization(centered, dim, baseline_storage);
+
+        // Expected x_mean_ip = Σ(widened[i] * mean[i])
+        float expected_x_mean_ip = 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            expected_x_mean_ip += widened_blob[i] * mean_f32[i];
+        }
+
+        // Expected query metadata (over original FP16 widened values)
+        float expected_y_sum = 0.0f;
+        float expected_y_sum_squares = 0.0f;
+        float expected_y_mean_ip = 0.0f;
+        for (size_t i = 0; i < dim; ++i) {
+            expected_y_sum += widened_blob[i];
+            expected_y_sum_squares += widened_blob[i] * widened_blob[i];
+            expected_y_mean_ip += widened_blob[i] * mean_f32[i];
+        }
+
+        vecsim_stl::vector<float> mean_vector(allocator);
+        for (size_t i = 0; i < dim; ++i) {
+            mean_vector.push_back(mean_f32[i]);
+        }
+        auto quant_preprocessor =
+            new (allocator) QuantPreprocessor<float16, Metric, true>(allocator, dim, mean_vector);
+
+        // Test preprocess (both storage and query)
+        {
+            void *storage_blob = nullptr;
+            void *query_blob = nullptr;
+            size_t storage_blob_size = original_blob_size;
+            size_t query_blob_size = original_blob_size;
+
+            quant_preprocessor->preprocess(original_blob, storage_blob, query_blob,
+                                           storage_blob_size, query_blob_size, alignment);
+
+            ASSERT_NE(storage_blob, nullptr);
+            ASSERT_EQ(storage_blob_size, expected_storage_size);
+            ASSERT_NE(query_blob, nullptr);
+            ASSERT_EQ(query_blob_size, expected_query_size);
+
+            // Quantized values must match the centered FP32 baseline
+            EXPECT_NO_FATAL_FAILURE(CompareVectors<uint8_t>(
+                static_cast<const uint8_t *>(storage_blob), baseline_storage, dim));
+
+            // Storage FP32 metadata (min, delta, sum, [sum_sq]) must match baseline
+            ASSERT_FLOAT_EQ(
+                load_meta(storage_blob, storage_meta_offset + sq8::MIN_VAL * sizeof(float)),
+                load_meta(baseline_storage, dim + sq8::MIN_VAL * sizeof(float)));
+            ASSERT_FLOAT_EQ(
+                load_meta(storage_blob, storage_meta_offset + sq8::DELTA * sizeof(float)),
+                load_meta(baseline_storage, dim + sq8::DELTA * sizeof(float)));
+            ASSERT_FLOAT_EQ(load_meta(storage_blob, storage_meta_offset + sq8::SUM * sizeof(float)),
+                            load_meta(baseline_storage, dim + sq8::SUM * sizeof(float)));
+            if constexpr (Metric == VecSimMetric_L2) {
+                ASSERT_FLOAT_EQ(
+                    load_meta(storage_blob, storage_meta_offset + sq8::SUM_SQUARES * sizeof(float)),
+                    load_meta(baseline_storage, dim + sq8::SUM_SQUARES * sizeof(float)));
+            }
+
+            // Verify x_mean_ip in storage metadata
+            ASSERT_FLOAT_EQ(
+                load_meta(storage_blob,
+                          storage_meta_offset + sq8::mean_ip_index<Metric>() * sizeof(float)),
+                expected_x_mean_ip);
+
+            // Query body must be a bit-equal copy of the FP16 input
+            EXPECT_NO_FATAL_FAILURE(CompareVectors<float16>(
+                static_cast<const float16 *>(query_blob), original_blob, dim));
+
+            // Query FP32 metadata
+            ASSERT_FLOAT_EQ(
+                load_meta(query_blob, query_meta_offset + sq8::SUM_QUERY * sizeof(float)),
+                expected_y_sum);
+            if constexpr (Metric == VecSimMetric_L2) {
+                ASSERT_FLOAT_EQ(load_meta(query_blob, query_meta_offset +
+                                                          sq8::SUM_SQUARES_QUERY * sizeof(float)),
+                                expected_y_sum_squares);
+            }
+            ASSERT_FLOAT_EQ(
+                load_meta(query_blob,
+                          query_meta_offset + sq8::query_mean_ip_index<Metric>() * sizeof(float)),
+                expected_y_mean_ip);
+
+            allocator->free_allocation(storage_blob);
+            allocator->free_allocation(query_blob);
+        }
+
+        // Test preprocessQuery alone
+        {
+            void *blob = nullptr;
+            size_t blob_size = original_blob_size;
+            quant_preprocessor->preprocessQuery(original_blob, blob, blob_size, alignment);
+
+            ASSERT_NE(blob, nullptr);
+            ASSERT_EQ(blob_size, expected_query_size);
+            EXPECT_NO_FATAL_FAILURE(
+                CompareVectors<float16>(static_cast<const float16 *>(blob), original_blob, dim));
+            ASSERT_FLOAT_EQ(load_meta(blob, query_meta_offset + sq8::SUM_QUERY * sizeof(float)),
+                            expected_y_sum);
+            if constexpr (Metric == VecSimMetric_L2) {
+                ASSERT_FLOAT_EQ(
+                    load_meta(blob, query_meta_offset + sq8::SUM_SQUARES_QUERY * sizeof(float)),
+                    expected_y_sum_squares);
+            }
+            ASSERT_FLOAT_EQ(load_meta(blob, query_meta_offset +
+                                                sq8::query_mean_ip_index<Metric>() * sizeof(float)),
+                            expected_y_mean_ip);
+            allocator->free_allocation(blob);
+        }
+
+        delete quant_preprocessor;
+    }
+};
+
+TEST_P(QuantPreprocessorFP16WithNormMetricTest, QuantizationBlobSizeAndMetadata) {
+    VecSimMetric metric = GetParam();
+    switch (metric) {
+    case VecSimMetric_L2:
+        runQuantizationTest<VecSimMetric_L2>();
+        break;
+    case VecSimMetric_IP:
+        runQuantizationTest<VecSimMetric_IP>();
+        break;
+    default:
+        FAIL() << "Unexpected metric (Cosine is rejected by static_assert for WithNorm=true)";
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(QuantPreprocessorFP16WithNormTests,
+                         QuantPreprocessorFP16WithNormMetricTest,
+                         testing::Values(VecSimMetric_L2, VecSimMetric_IP),
+                         [](const testing::TestParamInfo<VecSimMetric> &info) {
+                             return VecSimMetric_ToString(info.param);
+                         });

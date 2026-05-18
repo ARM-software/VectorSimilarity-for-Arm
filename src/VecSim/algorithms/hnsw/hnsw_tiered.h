@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -46,6 +47,8 @@ struct HNSWSwapJob : public VecsimBaseObject {
 
 static const size_t DEFAULT_PENDING_SWAP_JOBS_THRESHOLD = DEFAULT_BLOCK_SIZE;
 static const size_t MAX_PENDING_SWAP_JOBS_THRESHOLD = 100000;
+
+static const size_t MAX_QUANT_NORMALIZATION_SET_SIZE = 100 * DEFAULT_BLOCK_SIZE;
 
 /**
  * Definition of a job that repairs a certain node's connection in HNSW Index after delete
@@ -99,6 +102,14 @@ private:
     // Not atomic since it's only accessed from the main thread.
     size_t directHNSWInsertions{0};
 
+    // SQ accumulation phase members, only used for quantized tiered index
+    vecsim_stl::vector<float> runningSumVec;
+    size_t quantNormalizationSetSize;
+    bool isInAccumulationPhase;
+    VecSimParams backendIndexParams; // Saved params for creating the SQ backend
+
+    void initializeQuantizedBackend();
+
     void executeInsertJob(HNSWInsertJob *job);
     void executeRepairJob(HNSWRepairJob *job);
 
@@ -142,6 +153,26 @@ private:
 
     // Handle deletion of vector inplace considering that async deletion might occurred beforehand.
     int deleteLabelFromHNSWInplace(labelType label);
+
+    void addToSum(const DataType *vector) {
+        for (size_t i = 0; i < this->runningSumVec.size(); i++) {
+            if constexpr (std::is_same_v<DataType, float>) {
+                this->runningSumVec[i] += vector[i];
+            } else if constexpr (std::is_same_v<DataType, vecsim_types::float16>) {
+                this->runningSumVec[i] += FP16_to_FP32(vector[i]);
+            }
+        }
+    }
+
+    void subtractFromSum(const DataType *vector) {
+        for (size_t i = 0; i < this->runningSumVec.size(); i++) {
+            if constexpr (std::is_same_v<DataType, float>) {
+                this->runningSumVec[i] -= vector[i];
+            } else if constexpr (std::is_same_v<DataType, vecsim_types::float16>) {
+                this->runningSumVec[i] -= FP16_to_FP32(vector[i]);
+            }
+        }
+    }
 
 #ifdef BUILD_TESTS
 #include "VecSim/algorithms/hnsw/hnsw_tiered_tests_friends.h"
@@ -204,6 +235,16 @@ public:
                     std::shared_ptr<VecSimAllocator> allocator);
     virtual ~TieredHNSWIndex();
 
+    // Override query routing so that for quantized tiered indices the flat+backend
+    // merge always uses withSet=true (the flat and quantized backend scores are not
+    // directly comparable, so the withSet=false optimization is unsound).
+    // Also short-circuits to a flat-only query while in accumulation phase.
+    VecSimQueryReply *topKQuery(const void *queryBlob, size_t k,
+                                VecSimQueryParams *queryParams) const override;
+    VecSimQueryReply *rangeQuery(const void *queryBlob, double radius,
+                                 VecSimQueryParams *queryParams,
+                                 VecSimQueryReply_Order order) const override;
+
     int addVector(const void *blob, labelType label) override;
     int deleteVector(labelType label) override;
     size_t getNumMarkedDeleted() const override {
@@ -220,6 +261,9 @@ public:
     VecSimDebugInfoIterator *debugInfoIterator() const override;
     VecSimBatchIterator *newBatchIterator(const void *queryBlob,
                                           VecSimQueryParams *queryParams) const override {
+        if (isInAccumulationPhase) {
+            return this->frontendIndex->newBatchIterator(queryBlob, queryParams);
+        }
         // The query blob will be processed and copied by the internal indexes's batch iterator.
         return new (this->allocator)
             TieredHNSW_BatchIterator(queryBlob, this, queryParams, this->allocator);
@@ -661,7 +705,8 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSWIndex(HNSWIndex<DataType, DistTyp
     : VecSimTieredIndex<DataType, DistType>(hnsw_index, bf_index, tiered_index_params, allocator),
       labelToInsertJobs(this->allocator), idToRepairJobs(this->allocator),
       idToSwapJob(this->allocator), invalidJobs(this->allocator), currInvalidJobId(0),
-      readySwapJobs(0) {
+      readySwapJobs(0), runningSumVec(this->allocator), quantNormalizationSetSize(0),
+      isInAccumulationPhase(false) {
     // If the param for swapJobThreshold is 0 use the default value, if it exceeds the maximum
     // allowed, use the maximum value.
     this->pendingSwapJobsThreshold =
@@ -669,6 +714,20 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSWIndex(HNSWIndex<DataType, DistTyp
             ? DEFAULT_PENDING_SWAP_JOBS_THRESHOLD
             : std::min(tiered_index_params.specificParams.tieredHnswParams.swapJobThreshold,
                        MAX_PENDING_SWAP_JOBS_THRESHOLD);
+
+    // Initialize SQ accumulation phase if quantization is enabled.
+    auto &hnswParams = tiered_index_params.primaryIndexParams->algoParams.hnswParams;
+    if (hnswParams.quantType != VecSimQuant_NONE) {
+        size_t normSize =
+            tiered_index_params.specificParams.tieredHnswParams.QuantNormalizationSetSize;
+        if (normSize > 0) {
+            this->quantNormalizationSetSize = std::min(normSize, MAX_QUANT_NORMALIZATION_SET_SIZE);
+            this->isInAccumulationPhase = true;
+            this->runningSumVec.resize(hnswParams.dim, 0.0f);
+        }
+        // Save tiered params for creating the SQ backend
+        this->backendIndexParams = *(tiered_index_params.primaryIndexParams);
+    }
 }
 
 template <typename DataType, typename DistType>
@@ -693,6 +752,72 @@ TieredHNSWIndex<DataType, DistType>::~TieredHNSWIndex() {
     for (auto &it : this->invalidJobs) {
         delete it.second;
     }
+}
+
+template <typename DataType, typename DistType>
+VecSimQueryReply *
+TieredHNSWIndex<DataType, DistType>::topKQuery(const void *queryBlob, size_t k,
+                                               VecSimQueryParams *queryParams) const {
+    // Accumulation phase: backend is an empty placeholder. We can either short-circuit
+    // to a flat-only query (cheaper) or fall through to the standard path
+    // which will return only flat results anyway since the backend is empty.
+    // Short-circuit to keep the intent explicit.
+    if (this->isInAccumulationPhase) {
+        this->flatIndexGuard.lock_shared();
+        auto *res = this->frontendIndex->topKQuery(queryBlob, k, queryParams);
+        this->flatIndexGuard.unlock_shared();
+        return res;
+    }
+    // For quantized tiered, flat/backend scores are not directly comparable, so we
+    // must use withSet=true even for single-value indexes. Multi-value already
+    // uses withSet=true in the base.
+    bool isQuantized = this->backendIndexParams.algoParams.hnswParams.quantType != VecSimQuant_NONE;
+    if (isQuantized && !this->backendIndex->isMultiValue()) {
+        return this->template topKQueryImp<true>(queryBlob, k, queryParams);
+    }
+    return VecSimTieredIndex<DataType, DistType>::topKQuery(queryBlob, k, queryParams);
+}
+
+template <typename DataType, typename DistType>
+VecSimQueryReply *
+TieredHNSWIndex<DataType, DistType>::rangeQuery(const void *queryBlob, double radius,
+                                                VecSimQueryParams *queryParams,
+                                                VecSimQueryReply_Order order) const {
+    if (this->isInAccumulationPhase) {
+        this->flatIndexGuard.lock_shared();
+        auto *res = this->frontendIndex->rangeQuery(queryBlob, radius, queryParams);
+        this->flatIndexGuard.unlock_shared();
+        if (res) {
+            sort_results(res, order);
+        }
+        return res;
+    }
+    bool isQuantized = this->backendIndexParams.algoParams.hnswParams.quantType != VecSimQuant_NONE;
+    if (isQuantized && !this->backendIndex->isMultiValue()) {
+        return this->template rangeQueryImp<true>(queryBlob, radius, queryParams, order);
+    }
+    return VecSimTieredIndex<DataType, DistType>::rangeQuery(queryBlob, radius, queryParams, order);
+}
+
+template <typename DataType, typename DistType>
+void TieredHNSWIndex<DataType, DistType>::initializeQuantizedBackend() {
+    // Compute mean and create the SQ backend.
+    size_t dim = this->backendIndexParams.algoParams.hnswParams.dim;
+    vecsim_stl::vector<float> mean(dim, this->allocator);
+    for (size_t i = 0; i < dim; i++) {
+        mean[i] = this->runningSumVec[i] / this->quantNormalizationSetSize;
+    }
+
+    // Build HNSWParams with SQ quantization and computed mean.
+    VecSimParams newParams = this->backendIndexParams;
+    newParams.algoParams.hnswParams.quantParams = mean.data();
+
+    // Delete the old (non-quantized, empty) backend.
+    VecSimIndex_Free(this->backendIndex);
+
+    // Create new SQ HNSW backend. Normalization is done by the frontend index.
+    this->backendIndex = reinterpret_cast<VecSimIndexAbstract<DataType, DistType> *>(
+        HNSWFactory::NewIndex(&newParams, true));
 }
 
 template <typename DataType, typename DistType>
@@ -721,7 +846,8 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     auto hnsw_index = this->getHNSWIndex();
     // writeMode is not protected since it is assumed to be called only from the "main thread"
     // (that is the thread that is exclusively calling add/delete vector).
-    if (this->getWriteMode() == VecSim_WriteInPlace) {
+    // VecSim_WriteInPlace is ignored during the accumulation phase
+    if (!this->isInAccumulationPhase && this->getWriteMode() == VecSim_WriteInPlace) {
         // First, check if we need to overwrite the vector in-place for single (from both indexes).
         if (!this->backendIndex->isMultiValue()) {
             ret -= this->deleteVector(label);
@@ -739,7 +865,11 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
         ++this->directHNSWInsertions;
         return ret;
     }
-    if (this->frontendIndex->indexSize() >= this->flatBufferLimit) {
+    if (this->isInAccumulationPhase) {
+        // Accumulate the vectors in the running sum vector
+        auto storage_blob = this->frontendIndex->preprocessForStorage(blob);
+        this->addToSum(reinterpret_cast<const DataType *>(storage_blob.get()));
+    } else if (this->frontendIndex->indexSize() >= this->flatBufferLimit) {
         // Handle overwrite situation.
         if (!this->backendIndex->isMultiValue()) {
             // This will do nothing (and return 0) if this label doesn't exist. Otherwise, it may
@@ -766,6 +896,10 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     if (this->frontendIndex->isLabelExists(label) && !this->frontendIndex->isMultiValue()) {
         // Overwrite the vector and invalidate its only pending job (since we are not in MULTI).
         auto *old_job = this->labelToInsertJobs.at(label).at(0);
+        if (this->isInAccumulationPhase) {
+            const DataType *vector_data = this->frontendIndex->getDataByInternalId(old_job->id);
+            this->subtractFromSum(vector_data);
+        }
         old_job->id = this->setAndSaveInvalidJob(old_job);
         this->labelToInsertJobs.erase(label);
         ret = 0;
@@ -798,7 +932,7 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     // Here, a worker might ingest the previous vector that was stored under "label"
     // (in case of override in non-MULTI index) - so if it's there, we remove it (and create the
     // required repair jobs), *before* we submit the insert job.
-    if (!this->backendIndex->isMultiValue()) {
+    if (!this->isInAccumulationPhase && !this->backendIndex->isMultiValue()) {
         // If we removed the previous vector from both HNSW and flat in the overwrite process,
         // we still return 0 (not -1).
         ret = std::max(ret - this->deleteLabelFromHNSW(label), 0);
@@ -812,8 +946,27 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
         this->executeReadySwapJobs(this->pendingSwapJobsThreshold);
     }
 
-    // Insert job to the queue and signal the workers' updater.
-    this->submitSingleJob(new_insert_job);
+    if (!this->isInAccumulationPhase) {
+        // Insert job to the queue and signal the workers' updater.
+        this->submitSingleJob(new_insert_job);
+    } else if (this->frontendIndex->indexSize() >= this->quantNormalizationSetSize) {
+        // If we are in the accumulation phase and we just reached the quantization set size, we
+        // can initialize the backend index and transition to the regular mode.
+        this->initializeQuantizedBackend();
+
+        // Submit all pending insert jobs to the job queue.
+        vecsim_stl::vector<AsyncJob *> jobs(this->allocator);
+        jobs.reserve(this->labelToInsertJobs.size());
+        for (auto &entry : this->labelToInsertJobs) {
+            for (auto *job : entry.second) {
+                jobs.push_back(job);
+            }
+        }
+        this->submitJobs(jobs);
+
+        // Transition complete.
+        this->isInAccumulationPhase = false;
+    }
     return ret;
 }
 
@@ -829,6 +982,10 @@ int TieredHNSWIndex<DataType, DistType>::deleteVector(labelType label) {
             // Invalidate the pending insert job(s) into HNSW associated with this label
             auto &insert_jobs = this->labelToInsertJobs.at(label);
             for (auto *job : insert_jobs) {
+                if (this->isInAccumulationPhase) {
+                    const DataType *vector_data = this->frontendIndex->getDataByInternalId(job->id);
+                    this->subtractFromSum(vector_data);
+                }
                 job->id = this->setAndSaveInvalidJob(job);
             }
             num_deleted_vectors += insert_jobs.size();
@@ -848,6 +1005,10 @@ int TieredHNSWIndex<DataType, DistType>::deleteVector(labelType label) {
         this->flatIndexGuard.unlock();
     } else {
         this->flatIndexGuard.unlock_shared();
+    }
+
+    if (this->isInAccumulationPhase) {
+        return num_deleted_vectors;
     }
 
     // Next, check if there vector(s) stored under the given label in HNSW and delete them as well.
@@ -900,6 +1061,10 @@ double TieredHNSWIndex<DataType, DistType>::getDistanceFrom_Unsafe(labelType lab
     // Try to get the distance from the flat buffer.
     // If the label doesn't exist, the distance will be NaN.
     auto flat_dist = this->frontendIndex->getDistanceFrom_Unsafe(label, blob);
+
+    if (this->isInAccumulationPhase) {
+        return flat_dist;
+    }
 
     // Optimization. TODO: consider having different implementations for single and multi indexes,
     // to avoid checking the index type on every query.

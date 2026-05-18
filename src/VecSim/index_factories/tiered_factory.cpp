@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -97,6 +98,12 @@ inline size_t EstimateInitialSize(const TieredIndexParams *params) {
 VecSimIndex *NewIndex(const TieredIndexParams *params) {
     // Tiered index that contains HNSW index as primary index
     VecSimType type = params->primaryIndexParams->algoParams.hnswParams.type;
+    VecSimQuantType quantType = params->primaryIndexParams->algoParams.hnswParams.quantType;
+    if (quantType != VecSimQuant_NONE) {
+        if (type != VecSimType_FLOAT32 && type != VecSimType_FLOAT16) {
+            return nullptr; // Invalid type for quantization.
+        }
+    }
     if (type == VecSimType_FLOAT32) {
         return TieredHNSWFactory::NewIndex<float>(params);
     } else if (type == VecSimType_FLOAT64) {

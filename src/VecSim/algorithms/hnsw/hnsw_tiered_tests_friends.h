@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -71,6 +72,8 @@ friend class FP16TieredTest;
 friend class INT8TieredTest;
 friend class UINT8TieredTest;
 friend class CommonTypeMetricTieredTests_TestDataSizeTieredHNSW_Test;
+
+INDEX_TEST_FRIEND_CLASS(SQ8TieredHNSWTest)
 
 INDEX_TEST_FRIEND_CLASS(BM_VecSimBasics)
 INDEX_TEST_FRIEND_CLASS(BM_VecSimCommon)

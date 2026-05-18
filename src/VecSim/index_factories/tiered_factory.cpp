@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -96,6 +97,13 @@ inline size_t EstimateInitialSize(const TieredIndexParams *params) {
         throw std::invalid_argument("Invalid hnsw_params.type");
     }
 
+    VecSimQuantType quantType = hnsw_params.quantType;
+    size_t normSize = params->specificParams.tieredHnswParams.QuantNormalizationSetSize;
+    if (quantType != VecSimQuant_NONE && normSize > 0) {
+        // Add size of SQ accumulation buffer
+        est += allocations_overhead + hnsw_params.dim * sizeof(float);
+    }
+
     return est;
 }
 
@@ -108,6 +116,10 @@ VecSimIndex *NewIndex(const TieredIndexParams *params) {
 
     // Tiered index that contains HNSW index as primary index
     VecSimType type = params->primaryIndexParams->algoParams.hnswParams.type;
+    VecSimQuantType quantType = params->primaryIndexParams->algoParams.hnswParams.quantType;
+    if (quantType != VecSimQuant_NONE && type != VecSimType_FLOAT32 && type != VecSimType_FLOAT16) {
+        return nullptr;
+    }
     if (type == VecSimType_FLOAT32) {
         return TieredHNSWFactory::NewIndex<float>(params);
     } else if (type == VecSimType_FLOAT64) {

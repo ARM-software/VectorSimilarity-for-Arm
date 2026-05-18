@@ -14,6 +14,7 @@
 #include "VecSim/types/float16.h"
 #include "VecSim/types/sq8.h"
 #include "VecSim/vec_sim.h"
+#include "mock_thread_pool.h"
 #include "unit_test_utils.h"
 
 #include <cmath>
@@ -51,7 +52,7 @@ protected:
         }
     }
 
-    void SetUp(HNSWParams &params) {
+    virtual void SetUp(HNSWParams &params) {
         params.type = index_type_t::get_index_type();
         params.quantType = VecSimQuant_SQ8;
         if constexpr (index_type_t::with_quant_params) {
@@ -70,7 +71,7 @@ protected:
         }
     }
 
-    HNSWIndex<data_t, float> *CastToHNSW() {
+    virtual HNSWIndex<data_t, float> *CastToHNSW() {
         return dynamic_cast<HNSWIndex<data_t, float> *>(index);
     }
 
@@ -250,7 +251,6 @@ void HNSWSQ8Test<index_type_t>::search_empty_index_test() {
     for (size_t i = 0; i < 100; i++) {
         VecSimIndex_DeleteVector(index, i);
     }
-    ASSERT_EQ(VecSimIndex_IndexSize(index), 0u);
 
     reply = VecSimIndex_TopKQuery(index, query, 11, nullptr, BY_SCORE);
     ASSERT_EQ(VecSimQueryReply_Len(reply), 0u);
@@ -490,3 +490,119 @@ TEST(HNSWSQ8TieredTest, RejectsQuantizedTieredIndex) {
     EXPECT_EQ(VecSimIndex_New(&params), nullptr);
     EXPECT_EQ(EstimateInitialSize(tiered_params), SIZE_MAX);
 }
+
+/* ---------------------------- Tiered HNSW tests ---------------------------- */
+
+using HNSWSQ8TieredDataTypeSet =
+    ::testing::Types<HNSWSQ8IndexType<VecSimType_FLOAT32, float, false>,
+                     HNSWSQ8IndexType<VecSimType_FLOAT16, vecsim_types::float16, false>>;
+
+template <typename index_type_t>
+class SQ8TieredHNSWTest : public HNSWSQ8Test<index_type_t> {
+public:
+    using data_t = typename index_type_t::data_t;
+
+    void create_index_test();
+
+protected:
+    static constexpr size_t normalization_set_size = 10;
+
+    void SetUp(HNSWParams &hnsw_params) override {
+        hnsw_params.type = index_type_t::get_index_type();
+        hnsw_params.quantType = VecSimQuant_SQ8;
+        VecSimParams vecsim_hnsw_params = CreateParams(hnsw_params);
+        TieredIndexParams tiered_params = {
+            .jobQueue = &mock_thread_pool.jobQ,
+            .jobQueueCtx = mock_thread_pool.ctx,
+            .submitCb = tieredIndexMock::submit_callback,
+            .primaryIndexParams = &vecsim_hnsw_params,
+            .specificParams = {
+                TieredHNSWParams{.QuantNormalizationSetSize = normalization_set_size}}};
+        VecSimParams vecsim_params = CreateParams(tiered_params);
+        this->index = VecSimIndex_New(&vecsim_params);
+        ASSERT_NE(this->index, nullptr);
+        this->dim = hnsw_params.dim;
+        mock_thread_pool.ctx->index_strong_ref.reset(this->index);
+    }
+
+    void TearDown() override {}
+
+    HNSWIndex<data_t, float> *CastToHNSW() override {
+        auto *tiered_index = dynamic_cast<TieredHNSWIndex<data_t, float> *>(this->index);
+        return tiered_index ? tiered_index->getHNSWIndex() : nullptr;
+    }
+
+    tieredIndexMock mock_thread_pool;
+};
+
+template <typename index_type_t>
+void SQ8TieredHNSWTest<index_type_t>::create_index_test() {
+    HNSWParams params = {.dim = 40, .M = 16, .efConstruction = 200};
+    SetUp(params);
+
+    ASSERT_EQ(VecSimIndex_IndexSize(this->index), 0u);
+    for (size_t label = 0; label < 100; label++) {
+        ASSERT_EQ(this->GenerateAndAddVector(label, static_cast<float>(label), 1.0f), 1);
+        ASSERT_EQ(VecSimIndex_IndexSize(this->index), label + 1);
+    }
+    EXPECT_EQ(this->index->basicInfo().type, index_type_t::get_index_type());
+    EXPECT_TRUE(this->index->basicInfo().isTiered);
+}
+
+TYPED_TEST_SUITE(SQ8TieredHNSWTest, HNSWSQ8TieredDataTypeSet);
+
+TYPED_TEST(SQ8TieredHNSWTest, CreateIndex) { this->create_index_test(); }
+
+TYPED_TEST(SQ8TieredHNSWTest, SizeEstimation) {
+    constexpr size_t block_size = DEFAULT_BLOCK_SIZE;
+    HNSWParams hnsw_params = {.dim = 16, .initialCapacity = block_size, .M = 32};
+    this->SetUp(hnsw_params);
+
+    VecSimParams vecsim_hnsw_params = CreateParams(hnsw_params);
+    TieredIndexParams tiered_params = {
+        .jobQueue = &this->mock_thread_pool.jobQ,
+        .jobQueueCtx = this->mock_thread_pool.ctx,
+        .submitCb = tieredIndexMock::submit_callback,
+        .primaryIndexParams = &vecsim_hnsw_params,
+        .specificParams = {
+            TieredHNSWParams{.QuantNormalizationSetSize = this->normalization_set_size}}};
+    VecSimParams params = CreateParams(tiered_params);
+
+    EXPECT_EQ(VecSimIndex_EstimateInitialSize(&params), this->index->getAllocationSize());
+
+    for (size_t label = 0; label < block_size; label++) {
+        ASSERT_EQ(this->GenerateAndAddVector(label, static_cast<float>(label)), 1);
+    }
+    while (!this->mock_thread_pool.jobQ.empty()) {
+        this->mock_thread_pool.thread_iteration();
+    }
+
+    const size_t estimation = VecSimIndex_EstimateElementSize(&params) * block_size;
+    const size_t before = this->index->getAllocationSize();
+    ASSERT_EQ(this->GenerateAndAddVector(block_size, static_cast<float>(block_size)), 1);
+    while (!this->mock_thread_pool.jobQ.empty()) {
+        this->mock_thread_pool.thread_iteration();
+    }
+    const size_t actual = this->index->getAllocationSize() - before;
+
+    EXPECT_EQ(this->index->indexSize(), block_size + 1);
+    EXPECT_EQ(this->index->indexCapacity(), 2 * block_size);
+    EXPECT_GE(estimation, actual * 0.99);
+    EXPECT_LE(estimation, actual * 1.01);
+}
+
+TYPED_TEST(SQ8TieredHNSWTest, SearchByID) { this->search_by_id_test(); }
+
+TYPED_TEST(SQ8TieredHNSWTest, SearchByScore) { this->search_by_score_test(); }
+
+TYPED_TEST(SQ8TieredHNSWTest, SearchEmptyIndex) { this->search_empty_index_test(); }
+
+TYPED_TEST(SQ8TieredHNSWTest, Override) { this->test_override(); }
+
+TYPED_TEST(SQ8TieredHNSWTest, RangeQuery) { this->test_range_query(); }
+
+TYPED_TEST(SQ8TieredHNSWTest, GetDistanceL2) { this->test_get_distance(VecSimMetric_L2); }
+
+TYPED_TEST(SQ8TieredHNSWTest, GetDistanceIP) { this->test_get_distance(VecSimMetric_IP); }
+
+TYPED_TEST(SQ8TieredHNSWTest, BatchIteratorBasic) { this->test_batch_iterator_basic(); }

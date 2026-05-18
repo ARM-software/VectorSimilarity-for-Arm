@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -65,6 +66,9 @@ INDEX_TEST_FRIEND_CLASS(HNSWTieredIndexTestBasic_deleteInplaceMultiSwapId_Test)
 INDEX_TEST_FRIEND_CLASS(HNSWTieredIndexTestBasic_deleteInplaceAvoidUpdatedMarkedDeleted_Test)
 INDEX_TEST_FRIEND_CLASS(HNSWTieredIndexTestBasic_switchDeleteModes_Test)
 INDEX_TEST_FRIEND_CLASS(HNSWTieredIndexTestBasic_HNSWResize_Test)
+
+INDEX_TEST_FRIEND_CLASS(HNSWTieredIndexTestSQ8)
+INDEX_TEST_FRIEND_CLASS(SQ8TieredHNSWTest)
 
 friend class CommonAPITest_SearchDifferentScores_Test;
 friend class BF16TieredTest;

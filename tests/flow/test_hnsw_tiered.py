@@ -1,5 +1,6 @@
 # Copyright (c) 2006-Present, Redis Ltd.
 # All rights reserved.
+# SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 #
 # Licensed under your choice of the Redis Source Available License 2.0
 # (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -9,9 +10,10 @@ from common import *
 
 
 # swap_job_threshold = 0 means use the default swap_job_threshold defined in hnsw_tiered.h
-def create_tiered_hnsw_params(swap_job_threshold = 0):
+def create_tiered_hnsw_params(swap_job_threshold = 0, quant_norm_set_size = 0):
     tiered_hnsw_params = TieredHNSWParams()
     tiered_hnsw_params.swapJobThreshold = swap_job_threshold
+    tiered_hnsw_params.quantNormalizationSetSize = quant_norm_set_size
     return tiered_hnsw_params
 
 class IndexCtx:
@@ -41,7 +43,9 @@ class IndexCtx:
                  num_per_label=1,
                  swap_job_threshold=0,
                  flat_buffer_size=1024,
-                 create_data_func = None):
+                 create_data_func = None,
+                 quant_type=VecSimQuant_NONE,
+                 quant_norm_set_size=0):
         self.num_vectors = data_size
         self.dim = dim
         self.M = M
@@ -74,8 +78,9 @@ class IndexCtx:
                                               ef_construction = ef_c,
                                               m = M,
                                               ef_runtime = ef_r,
-                                              is_multi = self.is_multi)
-        self.tiered_hnsw_params = create_tiered_hnsw_params(swap_job_threshold)
+                                              is_multi = self.is_multi,
+                                              quant_type = quant_type)
+        self.tiered_hnsw_params = create_tiered_hnsw_params(swap_job_threshold, quant_norm_set_size)
 
         self.tiered_index = Tiered_HNSWIndex(self.hnsw_params, self.tiered_hnsw_params, flat_buffer_size)
 
@@ -141,8 +146,10 @@ class IndexCtx:
         }
         return bytes_to_mega(self.num_vectors * self.dim * memory_size[self.data_type])
 
-def create_tiered_index(test_logger, is_multi: bool, num_per_label=1, data_type=VecSimType_FLOAT32, create_data_func=None):
-    indices_ctx = IndexCtx(data_size=50000, is_multi=is_multi, num_per_label=num_per_label, data_type=data_type, create_data_func=create_data_func)
+def create_tiered_index(test_logger, is_multi: bool, num_per_label=1, data_type=VecSimType_FLOAT32, create_data_func=None,
+                        quant_type=VecSimQuant_NONE, quant_norm_set_size=0):
+    indices_ctx = IndexCtx(data_size=50000, is_multi=is_multi, num_per_label=num_per_label, data_type=data_type,
+                           create_data_func=create_data_func, quant_type=quant_type, quant_norm_set_size=quant_norm_set_size)
     test_logger.info(f"data type = {indices_ctx.data.dtype}")
     num_elements = indices_ctx.num_labels
 
@@ -182,10 +189,12 @@ def create_tiered_index(test_logger, is_multi: bool, num_per_label=1, data_type=
     test_logger.info(f"with {threads_num} threads, insertion runtime is {round_(execution_time_ratio)} times better")
 
 
-def search_insert(test_logger, is_multi: bool, num_per_label=1, data_type=VecSimType_FLOAT32, create_data_func=None):
+def search_insert(test_logger, is_multi: bool, num_per_label=1, data_type=VecSimType_FLOAT32, create_data_func=None,
+                  quant_type=VecSimQuant_NONE, quant_norm_set_size=0):
     data_size = 100000
     indices_ctx = IndexCtx(data_size=data_size, is_multi=is_multi, num_per_label=num_per_label,
-                           flat_buffer_size=data_size, M=64, data_type=data_type, create_data_func=create_data_func)
+                           flat_buffer_size=data_size, M=64, data_type=data_type, create_data_func=create_data_func,
+                           quant_type=quant_type, quant_norm_set_size=quant_norm_set_size)
     index = indices_ctx.tiered_index
 
     num_labels = indices_ctx.num_labels
@@ -295,6 +304,47 @@ def test_search_insert_multi_index(test_logger):
     test_logger.info("Start insert & search test for multi index")
 
     search_insert(test_logger, is_multi=True, num_per_label=5)
+
+def test_create_tiered_fp32_sq8(test_logger):
+    test_logger.info("Test create FP32 tiered hnsw index with SQ8 quantization")
+    create_tiered_index(test_logger, is_multi=False, data_type=VecSimType_FLOAT32,
+                        quant_type=VecSimQuant_SQ8)
+
+def test_create_tiered_fp16_sq8(test_logger):
+    test_logger.info("Test create FP16 tiered hnsw index with SQ8 quantization")
+    create_tiered_index(test_logger, is_multi=False, data_type=VecSimType_FLOAT16,
+                        quant_type=VecSimQuant_SQ8)
+
+def test_create_tiered_fp32_sq8_with_norm(test_logger):
+    test_logger.info("Test create FP32 tiered hnsw index with SQ8 quantization and mean normalization")
+    create_tiered_index(test_logger, is_multi=False, data_type=VecSimType_FLOAT32,
+                        quant_type=VecSimQuant_SQ8, quant_norm_set_size=10000)
+
+def test_create_tiered_fp16_sq8_with_norm(test_logger):
+    test_logger.info("Test create FP16 tiered hnsw index with SQ8 quantization and mean normalization")
+    create_tiered_index(test_logger, is_multi=False, data_type=VecSimType_FLOAT16,
+                        quant_type=VecSimQuant_SQ8, quant_norm_set_size=10000)
+
+def test_search_insert_fp32_sq8(test_logger):
+    test_logger.info("Start insert & search test for FP32 with SQ8 quantization")
+    search_insert(test_logger, is_multi=False, data_type=VecSimType_FLOAT32,
+                  quant_type=VecSimQuant_SQ8)
+
+def test_search_insert_fp16_sq8(test_logger):
+    test_logger.info("Start insert & search test for FP16 with SQ8 quantization")
+    search_insert(test_logger, is_multi=False, data_type=VecSimType_FLOAT16,
+                  quant_type=VecSimQuant_SQ8)
+
+def test_search_insert_fp32_sq8_with_norm(test_logger):
+    test_logger.info("Start insert & search test for FP32 with SQ8 quantization and mean normalization")
+    search_insert(test_logger, is_multi=False, data_type=VecSimType_FLOAT32,
+                  quant_type=VecSimQuant_SQ8, quant_norm_set_size=10000)
+
+def test_search_insert_fp16_sq8_with_norm(test_logger):
+    test_logger.info("Start insert & search test for FP16 with SQ8 quantization and mean normalization")
+    search_insert(test_logger, is_multi=False, data_type=VecSimType_FLOAT16,
+                  quant_type=VecSimQuant_SQ8, quant_norm_set_size=10000)
+
 
 # In this test we insert the vectors one by one to the tiered index (call wait_for_index after each add vector)
 # We expect to get the same index as if we were inserting the vector to the sync hnsw index.

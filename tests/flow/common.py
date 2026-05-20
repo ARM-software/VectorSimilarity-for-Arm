@@ -1,5 +1,6 @@
 # Copyright (c) 2006-Present, Redis Ltd.
 # All rights reserved.
+# SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 #
 # Licensed under your choice of the Redis Source Available License 2.0
 # (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -36,7 +37,7 @@ def create_svs_params (dim, num_elements, data_type, metric, quantBits = VecSimS
     return svs_params
 
 def create_hnsw_params(dim, num_elements, metric, data_type, ef_construction=200, m=16, ef_runtime=10, epsilon=0.01,
-                      is_multi=False):
+                      is_multi=False, quant_type=VecSimQuant_NONE, quant_params=None):
     hnsw_params = HNSWParams()
 
     hnsw_params.dim = dim
@@ -47,6 +48,9 @@ def create_hnsw_params(dim, num_elements, metric, data_type, ef_construction=200
     hnsw_params.efRuntime = ef_runtime
     hnsw_params.epsilon = epsilon
     hnsw_params.multi = is_multi
+    hnsw_params.quantType = quant_type
+    if quant_params is not None:
+        hnsw_params.quantParams = quant_params
 
     return hnsw_params
 

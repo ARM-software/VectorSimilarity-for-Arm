@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -22,6 +23,7 @@
 #include "pybind11/stl.h"
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 #include <VecSim/algorithms/hnsw/hnsw_single.h>
 #include <VecSim/algorithms/brute_force/brute_force_single.h>
 #include "mock_thread_pool.h"
@@ -54,8 +56,8 @@ py::object wrap_results(VecSimQueryReply **res, size_t num_res, size_t num_queri
         VecSimQueryReply_Free(res[i]);
     }
 
-    py::capsule free_when_done_l(data_numpy_l, [](void *labels) { delete[] (long *)labels; });
-    py::capsule free_when_done_d(data_numpy_d, [](void *dists) { delete[] (double *)dists; });
+    py::capsule free_when_done_l(data_numpy_l, [](void *labels) { delete[](long *) labels; });
+    py::capsule free_when_done_d(data_numpy_d, [](void *dists) { delete[](double *) dists; });
     return py::make_tuple(
         py::array_t<long>(
             {(size_t)num_queries, num_res},         // shape
@@ -138,7 +140,7 @@ private:
         }
 
         py::capsule free_when_done(data_numpy,
-                                   [](void *vector_data) { delete[] (NPArrayType *)vector_data; });
+                                   [](void *vector_data) { delete[](NPArrayType *) vector_data; });
         return py::array_t<NPArrayType>(
             {n_vectors, dim}, // shape
             {dim * sizeof(NPArrayType),
@@ -325,6 +327,7 @@ public:
             throw std::runtime_error("Invalid index data type");
         }
     }
+
     py::object searchKnnParallel(const py::object &input, size_t k, VecSimQueryParams *query_params,
                                  int n_threads) {
 
@@ -692,17 +695,51 @@ PYBIND11_MODULE(VecSim, m) {
         .value("BY_ID", BY_ID)
         .export_values();
 
-    py::class_<HNSWParams>(m, "HNSWParams")
-        .def(py::init())
-        .def_readwrite("type", &HNSWParams::type)
-        .def_readwrite("dim", &HNSWParams::dim)
-        .def_readwrite("metric", &HNSWParams::metric)
-        .def_readwrite("multi", &HNSWParams::multi)
-        .def_readwrite("initialCapacity", &HNSWParams::initialCapacity)
-        .def_readwrite("M", &HNSWParams::M)
-        .def_readwrite("efConstruction", &HNSWParams::efConstruction)
-        .def_readwrite("efRuntime", &HNSWParams::efRuntime)
-        .def_readwrite("epsilon", &HNSWParams::epsilon);
+    py::enum_<VecSimQuantType>(m, "VecSimQuantType")
+        .value("VecSimQuant_NONE", VecSimQuant_NONE)
+        .value("VecSimQuant_SQ8", VecSimQuant_SQ8)
+        .export_values();
+
+    // Static map to hold numpy array references for quantParams, preventing GC
+    // while the HNSWParams object is alive. Cleaned up when quantParams is set to None.
+    static std::unordered_map<HNSWParams *, py::array_t<float>> s_quantParamsHolder;
+
+    auto hnsw_params_class =
+        py::class_<HNSWParams>(m, "HNSWParams")
+            .def(py::init([]() {
+                HNSWParams p{};
+                p.quantParams = nullptr;
+                return p;
+            }))
+            .def_readwrite("type", &HNSWParams::type)
+            .def_readwrite("dim", &HNSWParams::dim)
+            .def_readwrite("metric", &HNSWParams::metric)
+            .def_readwrite("multi", &HNSWParams::multi)
+            .def_readwrite("initialCapacity", &HNSWParams::initialCapacity)
+            .def_readwrite("M", &HNSWParams::M)
+            .def_readwrite("efConstruction", &HNSWParams::efConstruction)
+            .def_readwrite("efRuntime", &HNSWParams::efRuntime)
+            .def_readwrite("epsilon", &HNSWParams::epsilon)
+            .def_readwrite("quantType", &HNSWParams::quantType)
+            .def_property(
+                "quantParams",
+                [](HNSWParams &p) -> py::object {
+                    auto it = s_quantParamsHolder.find(&p);
+                    if (it != s_quantParamsHolder.end()) {
+                        return it->second;
+                    }
+                    return py::none();
+                },
+                [](HNSWParams &p, py::object value) {
+                    if (value.is_none()) {
+                        p.quantParams = nullptr;
+                        s_quantParamsHolder.erase(&p);
+                    } else {
+                        py::array_t<float, py::array::c_style | py::array::forcecast> arr(value);
+                        s_quantParamsHolder[&p] = arr;
+                        p.quantParams = static_cast<void *>(arr.mutable_data());
+                    }
+                });
 
     py::class_<BFParams>(m, "BFParams")
         .def(py::init())
@@ -746,7 +783,8 @@ PYBIND11_MODULE(VecSim, m) {
 
     py::class_<TieredHNSWParams>(m, "TieredHNSWParams")
         .def(py::init())
-        .def_readwrite("swapJobThreshold", &TieredHNSWParams::swapJobThreshold);
+        .def_readwrite("swapJobThreshold", &TieredHNSWParams::swapJobThreshold)
+        .def_readwrite("quantNormalizationSetSize", &TieredHNSWParams::QuantNormalizationSetSize);
 
     py::class_<TieredSVSParams>(m, "TieredSVSParams")
         .def(py::init())

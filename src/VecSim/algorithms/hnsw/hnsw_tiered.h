@@ -799,9 +799,14 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSWIndex(HNSWIndex<DataType, DistTyp
     : VecSimTieredIndex<DataType, DistType>(hnsw_index, bf_index, tiered_index_params, allocator),
       labelToInsertJobs(this->allocator), idToRepairJobs(this->allocator),
       idToSwapJob(this->allocator), invalidJobs(this->allocator), currInvalidJobId(0),
-      readySwapJobs(0),
-      isQuantized(tiered_index_params.primaryIndexParams->algoParams.hnswParams.quantType !=
-                  VecSimQuant_NONE) {
+      readySwapJobs(0), isQuantized(false) {
+    // For benchmark, we create tiered hnsw index from existing hnsw index
+    // primaryIndexParams is nullptr and accumulation phase is skipped for sq8
+    if (!tiered_index_params.primaryIndexParams) {
+        return;
+    }
+    this->isQuantized =
+        tiered_index_params.primaryIndexParams->algoParams.hnswParams.quantType != VecSimQuant_NONE;
     const auto &hnsw_params = tiered_index_params.primaryIndexParams->algoParams.hnswParams;
     const size_t normalization_set_size =
         tiered_index_params.specificParams.tieredHnswParams.QuantNormalizationSetSize;

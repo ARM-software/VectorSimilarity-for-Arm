@@ -51,6 +51,8 @@ VecSimIndex *NewIndex_SQ8(const HNSWParams *hnswParams,
     auto asym_func =
         spaces::GetDistFunc<vecsim_types::sq8, float, DataType>(Metric, dim, &alignment);
 
+    HNSWIndex<DataType, float> *index = nullptr;
+
     if (mean_ptr == nullptr) {
         // No mean vector: plain SQ8 quantization without mean centering.
         auto *pp = new (allocator) QuantPreprocessor<DataType, Metric>(allocator, dim);
@@ -65,32 +67,43 @@ VecSimIndex *NewIndex_SQ8(const HNSWParams *hnswParams,
             new (allocator) DistanceCalculatorCommon<float>(allocator, sym_func, asym_func);
 
         IndexComponents<DataType, float> components{calc, container};
-        return NewIndex_ChooseMultiOrSingle<DataType, float>(hnswParams, abstractInitParams,
-                                                             components);
+        index = NewIndex_ChooseMultiOrSingle<DataType, float>(hnswParams, abstractInitParams,
+                                                              components);
+    } else {
+        // With mean vector: mean-centered SQ8 quantization with norm correction.
+        vecsim_stl::vector<float> mean_vec(dim, 0.0f, allocator);
+        std::copy(mean_ptr, mean_ptr + dim, mean_vec.begin());
+
+        float mean_sum_squares = 0.0f;
+        for (float v : mean_vec) {
+            mean_sum_squares += v * v;
+        }
+
+        auto *pp =
+            new (allocator) QuantPreprocessor<DataType, Metric, true>(allocator, dim, mean_vec);
+        auto *container =
+            new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
+        int ret = container->addPreprocessor(pp);
+        assert(ret == 0 && "SQ8 preprocessor was not added correctly");
+        UNUSED(ret);
+
+        auto *calc = new (allocator) DistanceCalculatorWithNorm<DataType, float, Metric>(
+            allocator, asym_func, sym_func, mean_sum_squares);
+
+        IndexComponents<DataType, float> components{calc, container};
+        index = NewIndex_ChooseMultiOrSingle<DataType, float>(hnswParams, abstractInitParams,
+                                                              components);
     }
 
-    // With mean vector: mean-centered SQ8 quantization with norm correction.
-    vecsim_stl::vector<float> mean_vec(dim, 0.0f, allocator);
-    std::copy(mean_ptr, mean_ptr + dim, mean_vec.begin());
-
-    float mean_sum_squares = 0.0f;
-    for (float v : mean_vec) {
-        mean_sum_squares += v * v;
+#ifdef BUILD_TESTS
+    // Store quantization metadata for serialization support.
+    index->quantType = hnswParams->quantType;
+    if (mean_ptr != nullptr) {
+        index->serializedMeanVector.assign(mean_ptr, mean_ptr + dim);
     }
+#endif
 
-    auto *pp = new (allocator) QuantPreprocessor<DataType, Metric, true>(allocator, dim, mean_vec);
-    auto *container =
-        new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
-    int ret = container->addPreprocessor(pp);
-    assert(ret == 0 && "SQ8 preprocessor was not added correctly");
-    UNUSED(ret);
-
-    auto *calc = new (allocator) DistanceCalculatorWithNorm<DataType, float, Metric>(
-        allocator, asym_func, sym_func, mean_sum_squares);
-
-    IndexComponents<DataType, float> components{calc, container};
-    return NewIndex_ChooseMultiOrSingle<DataType, float>(hnswParams, abstractInitParams,
-                                                         components);
+    return index;
 }
 
 VecSimIndex *NewIndex(const VecSimParams *params, bool is_normalized) {
@@ -297,7 +310,8 @@ template <typename DataType, typename DistType = DataType>
 inline VecSimIndex *NewIndex_ChooseMultiOrSingle(std::ifstream &input, const HNSWParams *params,
                                                  const AbstractIndexInitParams &abstractInitParams,
                                                  IndexComponents<DataType, DistType> &components,
-                                                 HNSWSerializer::EncodingVersion version) {
+                                                 HNSWSerializer::EncodingVersion version,
+                                                 const std::vector<float> &meanVector = {}) {
     HNSWIndex<DataType, DistType> *index = nullptr;
     // check if single and call the ctor that loads index information from file.
     if (params->multi)
@@ -309,17 +323,79 @@ inline VecSimIndex *NewIndex_ChooseMultiOrSingle(std::ifstream &input, const HNS
 
     index->restoreGraph(input, version);
 
+#ifdef BUILD_TESTS
+    // Store quantization metadata for re-serialization.
+    index->quantType = params->quantType;
+    if (!meanVector.empty()) {
+        index->serializedMeanVector = meanVector;
+    }
+#endif
+
     return index;
 }
 
-// Initialize @params from file for V3
-static void InitializeParams(std::ifstream &source_params, HNSWParams &params) {
+// Initialize @params from file for V3+. For V5+ also reads quantType and mean vector.
+static void InitializeParams(std::ifstream &source_params, HNSWParams &params,
+                             HNSWSerializer::EncodingVersion version,
+                             std::vector<float> &meanVector) {
     Serializer::readBinaryPOD(source_params, params.dim);
     Serializer::readBinaryPOD(source_params, params.type);
     Serializer::readBinaryPOD(source_params, params.metric);
     Serializer::readBinaryPOD(source_params, params.blockSize);
     Serializer::readBinaryPOD(source_params, params.multi);
     Serializer::readBinaryPOD(source_params, params.initialCapacity);
+
+    // V5: read quantization fields
+    if (version >= HNSWSerializer::EncodingVersion::V5) {
+        Serializer::readBinaryPOD(source_params, params.quantType);
+        if (params.quantType == VecSimQuant_SQ8) {
+            bool hasMean = false;
+            Serializer::readBinaryPOD(source_params, hasMean);
+            if (hasMean) {
+                meanVector.resize(params.dim);
+                source_params.read(reinterpret_cast<char *>(meanVector.data()),
+                                   params.dim * sizeof(float));
+            }
+        }
+    }
+}
+
+// Helper to create SQ8 IndexComponents for loading from file.
+template <typename DataType, VecSimMetric Metric>
+IndexComponents<DataType, float>
+CreateSQ8Components(const std::shared_ptr<VecSimAllocator> &allocator, size_t dim,
+                    const float *mean_ptr) {
+    unsigned char alignment = 0;
+
+    auto sym_func = spaces::GetDistFunc<vecsim_types::sq8, float>(Metric, dim, &alignment);
+    auto asym_func =
+        spaces::GetDistFunc<vecsim_types::sq8, float, DataType>(Metric, dim, &alignment);
+
+    if (mean_ptr == nullptr) {
+        auto *pp = new (allocator) QuantPreprocessor<DataType, Metric>(allocator, dim);
+        auto *container =
+            new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
+        container->addPreprocessor(pp);
+        auto *calc =
+            new (allocator) DistanceCalculatorCommon<float>(allocator, sym_func, asym_func);
+        return IndexComponents<DataType, float>{calc, container};
+    }
+
+    vecsim_stl::vector<float> mean_vec(dim, 0.0f, allocator);
+    std::copy(mean_ptr, mean_ptr + dim, mean_vec.begin());
+
+    float mean_sum_squares = 0.0f;
+    for (float v : mean_vec) {
+        mean_sum_squares += v * v;
+    }
+
+    auto *pp = new (allocator) QuantPreprocessor<DataType, Metric, true>(allocator, dim, mean_vec);
+    auto *container =
+        new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
+    container->addPreprocessor(pp);
+    auto *calc = new (allocator) DistanceCalculatorWithNorm<DataType, float, Metric>(
+        allocator, asym_func, sym_func, mean_sum_squares);
+    return IndexComponents<DataType, float>{calc, container};
 }
 
 VecSimIndex *NewIndex(const std::string &location, bool is_normalized) {
@@ -344,14 +420,64 @@ VecSimIndex *NewIndex(const std::string &location, bool is_normalized) {
             bad_name);
     }
 
-    HNSWParams params;
-    InitializeParams(input, params);
-
-    VecSimParams vecsimParams = {.algo = VecSimAlgo_HNSWLIB,
-                                 .algoParams = {.hnswParams = HNSWParams{params}}};
+    HNSWParams params = {};
+    std::vector<float> meanVector;
+    InitializeParams(input, params, version, meanVector);
 
     AbstractIndexInitParams abstractInitParams =
-        VecSimFactory::NewAbstractInitParams(&params, vecsimParams.logCtx, is_normalized);
+        VecSimFactory::NewAbstractInitParams(&params, nullptr, is_normalized);
+
+    // SQ8 quantized index path
+    if (params.quantType == VecSimQuant_SQ8) {
+        const float *mean_ptr = meanVector.empty() ? nullptr : meanVector.data();
+        VecSimMetric metric = params.metric;
+        if (is_normalized && metric == VecSimMetric_Cosine) {
+            metric = VecSimMetric_IP;
+        }
+
+        // Override blob sizes for SQ8 storage layout.
+        size_t dim = params.dim;
+        if (metric == VecSimMetric_L2) {
+            abstractInitParams.storedDataSize =
+                dim + (mean_ptr ? sq8::storage_metadata_count_with_norm<VecSimMetric_L2>()
+                                : sq8::storage_metadata_count<VecSimMetric_L2>()) *
+                          sizeof(float);
+        } else {
+            abstractInitParams.storedDataSize =
+                dim + (mean_ptr ? sq8::storage_metadata_count_with_norm<VecSimMetric_IP>()
+                                : sq8::storage_metadata_count<VecSimMetric_IP>()) *
+                          sizeof(float);
+        }
+
+        if (params.type == VecSimType_FLOAT32) {
+            abstractInitParams.inputBlobSize = dim * sizeof(float);
+            if (metric == VecSimMetric_L2) {
+                auto components = CreateSQ8Components<float, VecSimMetric_L2>(
+                    abstractInitParams.allocator, dim, mean_ptr);
+                return NewIndex_ChooseMultiOrSingle<float>(input, &params, abstractInitParams,
+                                                           components, version, meanVector);
+            } else {
+                auto components = CreateSQ8Components<float, VecSimMetric_IP>(
+                    abstractInitParams.allocator, dim, mean_ptr);
+                return NewIndex_ChooseMultiOrSingle<float>(input, &params, abstractInitParams,
+                                                           components, version, meanVector);
+            }
+        } else if (params.type == VecSimType_FLOAT16) {
+            abstractInitParams.inputBlobSize = dim * sizeof(float16);
+            if (metric == VecSimMetric_L2) {
+                auto components = CreateSQ8Components<float16, VecSimMetric_L2>(
+                    abstractInitParams.allocator, dim, mean_ptr);
+                return NewIndex_ChooseMultiOrSingle<float16, float>(
+                    input, &params, abstractInitParams, components, version, meanVector);
+            } else {
+                auto components = CreateSQ8Components<float16, VecSimMetric_IP>(
+                    abstractInitParams.allocator, dim, mean_ptr);
+                return NewIndex_ChooseMultiOrSingle<float16, float>(
+                    input, &params, abstractInitParams, components, version, meanVector);
+            }
+        }
+    }
+
     if (params.type == VecSimType_FLOAT32) {
         IndexComponents<float, float> indexComponents = CreateIndexComponents<float, float>(
             abstractInitParams.allocator, params.metric, abstractInitParams.dim, is_normalized);

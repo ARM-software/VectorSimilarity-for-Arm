@@ -128,6 +128,12 @@ protected:
 #include "VecSim/algorithms/hnsw/hnsw_base_tests_friends.h"
 
 #include "hnsw_serializer_declarations.h"
+
+public:
+    // Serialization-only fields for V5 format (SQ8 support)
+    VecSimQuantType quantType = VecSimQuant_NONE;
+    std::vector<float> serializedMeanVector; // Mean vector for SQ8 indices (empty if not SQ8)
+private:
 #endif
 
 protected:

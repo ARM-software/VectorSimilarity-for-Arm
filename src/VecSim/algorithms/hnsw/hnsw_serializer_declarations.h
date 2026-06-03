@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -24,6 +25,12 @@ virtual void saveIndexIMP(std::ofstream &output) override;
 
 // used by index factory to load nodes connections
 void restoreGraph(std::ifstream &input, HNSWSerializer::EncodingVersion version);
+
+// Returns V5 if this is an SQ8 index, V4 otherwise.
+HNSWSerializer::EncodingVersion getWriteVersion() const override {
+    return quantType != VecSimQuant_NONE ? HNSWSerializer::EncodingVersion::V5
+                                         : HNSWSerializer::EncodingVersion::V4;
+}
 
 private:
 // Functions for index saving.

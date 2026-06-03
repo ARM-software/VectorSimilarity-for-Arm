@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
+ * SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * Licensed under your choice of the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
@@ -252,6 +253,18 @@ void HNSWIndex<DataType, DistType>::saveIndexFields(std::ofstream &output) const
     writeBinaryPOD(output, this->isMulti);
     writeBinaryPOD(output, this->maxElements); // This will be used to restore the index initial
                                                // capacity
+
+    // V5 fields: SQ8 quantization support (between factory params and index build params)
+    if (this->quantType != VecSimQuant_NONE) {
+        writeBinaryPOD(output, this->quantType);
+        // Write mean vector (dim floats). Empty vector means no mean (zero-mean SQ8).
+        bool hasMean = !this->serializedMeanVector.empty();
+        writeBinaryPOD(output, hasMean);
+        if (hasMean) {
+            output.write(reinterpret_cast<const char *>(this->serializedMeanVector.data()),
+                         this->dim * sizeof(float));
+        }
+    }
 
     // Save index build parameters
     writeBinaryPOD(output, this->M);

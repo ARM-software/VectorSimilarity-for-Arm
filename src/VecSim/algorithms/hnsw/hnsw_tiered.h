@@ -715,6 +715,12 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSWIndex(HNSWIndex<DataType, DistTyp
             : std::min(tiered_index_params.specificParams.tieredHnswParams.swapJobThreshold,
                        MAX_PENDING_SWAP_JOBS_THRESHOLD);
 
+    // For benchmark, we create tiered hnsw index from existing hnsw index
+    // primaryIndexParams is nullptr and accumulation phase is skipped for sq8
+    if (tiered_index_params.primaryIndexParams == nullptr) {
+        return;
+    }
+
     // Initialize SQ accumulation phase if quantization is enabled.
     auto &hnswParams = tiered_index_params.primaryIndexParams->algoParams.hnswParams;
     if (hnswParams.quantType != VecSimQuant_NONE) {

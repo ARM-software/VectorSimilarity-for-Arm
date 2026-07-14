@@ -25,8 +25,6 @@ public:
 
     virtual DistType calcDistance(const void *v1, const void *v2, size_t dim) const = 0;
 
-    // Used for stored candidate distance vs query vector.
-    // Default implementation delegates to calcDistance for backward compatibility.
     virtual DistType calcDistanceForQuery(const void *candidate_vector, const void *query_vector,
                                           size_t dim) const = 0;
 

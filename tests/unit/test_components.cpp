@@ -1596,14 +1596,12 @@ protected:
 
     template <VecSimMetric Metric>
     size_t getExpectedStorageSize() const {
-        return dim * sizeof(uint8_t) +
-               sq8::storage_metadata_count_with_norm<Metric>() * sizeof(float);
+        return dim * sizeof(uint8_t) + sq8::storage_metadata_count<Metric, true>() * sizeof(float);
     }
 
     template <VecSimMetric Metric>
     size_t getExpectedQuerySize() const {
-        return dim * sizeof(DataType) +
-               sq8::query_metadata_count_with_norm<Metric>() * sizeof(float);
+        return dim * sizeof(DataType) + sq8::query_metadata_count<Metric, true>() * sizeof(float);
     }
 
     template <VecSimMetric Metric>

@@ -255,20 +255,27 @@ class QuantPreprocessor : public PreprocessorInterface {
     void quantize(const DataType *input, OUTPUT_TYPE *quantized) const {
         assert(input && quantized);
 
-        float x_mean_ip = 0.0f; // only used for WithNorm
+        if constexpr (std::is_same_v<DataType, float> && !WithNorm) {
+            quantize_impl(input, quantized);
+        } else {
+            float x_mean_ip = 0.0f; // only used for WithNorm
 
-        // Get transformed values (convert to float, mean-subtracted for WithNorm)
-        vecsim_stl::vector<float> values(this->dim, this->allocator);
-        for (size_t i = 0; i < this->dim; ++i) {
-            values[i] = to_fp32<DataType>(input[i]);
-            if constexpr (WithNorm) {
-                x_mean_ip += values[i] * mean[i];
-                values[i] -= mean[i];
+            // Get transformed values (convert to float, mean-subtracted for WithNorm)
+            vecsim_stl::vector<float> values(this->dim, this->allocator);
+            for (size_t i = 0; i < this->dim; ++i) {
+                values[i] = to_fp32<DataType>(input[i]);
+                if constexpr (WithNorm) {
+                    x_mean_ip += values[i] * mean[i];
+                    values[i] -= mean[i];
+                }
             }
+            quantize_impl(values.data(), quantized, x_mean_ip);
         }
+    }
 
+    void quantize_impl(const float *values, OUTPUT_TYPE *quantized, float x_mean_ip = 0.0f) const {
         // Find min and max values.
-        auto [min_val, max_val] = find_min_max(values.data());
+        auto [min_val, max_val] = find_min_max(values);
 
         // Calculate scaling factor (typed as MetadataType because they end up as metadata).
         const MetadataType diff = (max_val - min_val);
@@ -334,23 +341,11 @@ class QuantPreprocessor : public PreprocessorInterface {
         // Metadata uses MetadataType. Use memcpy because the metadata offset
         // (dim * sizeof(uint8_t)) is not guaranteed to be sizeof(MetadataType)-aligned.
         void *meta_dst = quantized + this->dim;
-        if constexpr (!WithNorm) {
-            if constexpr (Metric == VecSimMetric_L2) {
-                const MetadataType buf[4] = {min_val, delta, sum, sum_squares};
-                memcpy(meta_dst, buf, sizeof(buf));
-            } else {
-                const MetadataType buf[3] = {min_val, delta, sum};
-                memcpy(meta_dst, buf, sizeof(buf));
-            }
-        } else {
-            if constexpr (Metric == VecSimMetric_L2) {
-                const MetadataType buf[5] = {min_val, delta, sum, sum_squares, x_mean_ip};
-                memcpy(meta_dst, buf, sizeof(buf));
-            } else {
-                const MetadataType buf[4] = {min_val, delta, sum, x_mean_ip};
-                memcpy(meta_dst, buf, sizeof(buf));
-            }
-        }
+        MetadataType buf[5] = {min_val, delta, sum};
+        size_t n = 3;
+        if constexpr (Metric == VecSimMetric_L2) buf[n++] = sum_squares;
+        if constexpr (WithNorm) buf[n++] = x_mean_ip;
+        memcpy(meta_dst, buf, n * sizeof(MetadataType));
     }
 
     // Computes and writes query metadata (FP32) in a single pass over the input vector.
@@ -420,23 +415,11 @@ class QuantPreprocessor : public PreprocessorInterface {
         // Metadata uses MetadataType. Use memcpy because the metadata offset (after the query
         // body of dim * sizeof(DataType)) is not guaranteed to be sizeof(MetadataType)-aligned
         // when DataType is float16 and dim is odd.
-        if constexpr (!WithNorm) {
-            if constexpr (Metric == VecSimMetric_L2) {
-                const MetadataType buf[2] = {sum, sum_squares};
-                memcpy(output_metadata, buf, sizeof(buf));
-            } else {
-                const MetadataType buf[1] = {sum};
-                memcpy(output_metadata, buf, sizeof(buf));
-            }
-        } else {
-            if constexpr (Metric == VecSimMetric_L2) {
-                const MetadataType buf[3] = {sum, sum_squares, y_mean_ip};
-                memcpy(output_metadata, buf, sizeof(buf));
-            } else {
-                const MetadataType buf[2] = {sum, y_mean_ip};
-                memcpy(output_metadata, buf, sizeof(buf));
-            }
-        }
+        MetadataType buf[3] = {sum};
+        size_t n = 1;
+        if constexpr (Metric == VecSimMetric_L2) buf[n++] = sum_squares;
+        if constexpr (WithNorm) buf[n++] = y_mean_ip;
+        memcpy(output_metadata, buf, n * sizeof(MetadataType));
     }
 
 public:
@@ -453,10 +436,10 @@ public:
                       const vecsim_stl::vector<float> &mean_vec) requires(WithNorm)
         : PreprocessorInterface(allocator), mean(mean_vec), dim(dim),
           storage_bytes_count(dim * sizeof(OUTPUT_TYPE) +
-                              sq8::storage_metadata_count_with_norm<Metric>() *
+                              sq8::storage_metadata_count<Metric, WithNorm>() *
                                   sizeof(MetadataType)),
           query_bytes_count(dim * sizeof(DataType) +
-                            sq8::query_metadata_count_with_norm<Metric>() * sizeof(MetadataType)) {
+                            sq8::query_metadata_count<Metric, WithNorm>() * sizeof(MetadataType)) {
         assert(this->mean.size() == dim && "mean vector size must equal dim");
     }
 

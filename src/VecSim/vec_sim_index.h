@@ -164,28 +164,28 @@ public:
      *
      * Uses the cached dist func to avoid the indexCalculator vtable on the hot path.
      *
-     * @note Precondition: @c cachedDistFunc must be non-null. Subclasses that construct
-     *       this index with a null @c indexCalculator (e.g. SVS, which uses its own
-     *       internal distance kernels) must not call this method.
-     *
      * @return the distance between the vectors.
      */
     DistType calcDistance(const void *vector_data1, const void *vector_data2) const {
-        return cachedDistFunc(vector_data1, vector_data2, this->dim);
+        if (cachedDistFunc) {
+            return cachedDistFunc(vector_data1, vector_data2, this->dim);
+        } else {
+            return indexCalculator->calcDistance(vector_data1, vector_data2, this->dim);
+        }
     }
 
     /**
      * @brief Calculate the distance between a stored candidate vector and a query vector.
      * Allows asymmetric distance computation (e.g., for quantized stored vectors).
      *
-     * @note Precondition: @c cachedDistFuncForQuery must be non-null. Subclasses that construct
-     * this index with a null @c indexCalculator (e.g. SVS, which uses its own
-     * internal distance kernels) must not call this method.
-     *
      * @return the distance between the candidate and the query.
      */
     DistType calcDistanceForQuery(const void *candidate_vector, const void *query_vector) const {
-        return cachedDistFuncForQuery(candidate_vector, query_vector, this->dim);
+        if (cachedDistFuncForQuery) {
+            return cachedDistFuncForQuery(candidate_vector, query_vector, this->dim);
+        } else {
+            return indexCalculator->calcDistanceForQuery(candidate_vector, query_vector, this->dim);
+        }
     }
 
     /**

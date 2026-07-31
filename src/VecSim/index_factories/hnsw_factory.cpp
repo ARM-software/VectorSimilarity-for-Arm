@@ -52,22 +52,25 @@ VecSimIndex *NewIndex_SQ8(const HNSWParams *hnswParams, AbstractIndexInitParams 
                           const float *mean_ptr) {
     auto &allocator = abstractInitParams.allocator;
     size_t dim = abstractInitParams.dim;
-    unsigned char alignment = 0;
+    unsigned char storage_alignment = 0, asym_storage_alignment = 0, query_alignment = 0;
     bool with_norm = mean_ptr != nullptr;
 
     // Override blob size for the SQ8 storage layout.
     abstractInitParams.storedDataSize = GetSQ8StoredDataSize<Metric>(dim, with_norm);
 
     // Symmetric: both stored vectors are SQ8 blobs.
-    auto sym_func = spaces::GetDistFunc<sq8, float>(Metric, dim, &alignment);
+    auto sym_func = spaces::GetDistFunc<sq8, float>(Metric, dim, &storage_alignment);
     // Asymmetric: stored vector is SQ8 blob, query is DataType.
-    auto asym_func = spaces::GetDistFunc<sq8, float, DataType>(Metric, dim, &alignment);
+    auto asym_func =
+        spaces::GetDistFunc<sq8, float, DataType>(Metric, dim, &asym_storage_alignment);
+    storage_alignment = spaces::combineAlignments(storage_alignment, asym_storage_alignment);
+    spaces::GetDistFunc<DataType, float>(Metric, dim, &query_alignment);
 
     if (!with_norm) {
         // plain SQ8 quantization without mean centering.
         auto *pp = new (allocator) QuantPreprocessor<DataType, Metric>(allocator, dim);
-        auto *container =
-            new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
+        auto *container = new (allocator)
+            MultiPreprocessorsContainer<DataType, 1>(allocator, query_alignment, storage_alignment);
         [[maybe_unused]] int ret = container->addPreprocessor(pp);
         assert(ret == 0 && "SQ8 preprocessor was not added correctly");
 
@@ -90,8 +93,8 @@ VecSimIndex *NewIndex_SQ8(const HNSWParams *hnswParams, AbstractIndexInitParams 
     }
 
     auto *pp = new (allocator) QuantPreprocessor<DataType, Metric, true>(allocator, dim, mean_vec);
-    auto *container =
-        new (allocator) MultiPreprocessorsContainer<DataType, 1>(allocator, alignment);
+    auto *container = new (allocator)
+        MultiPreprocessorsContainer<DataType, 1>(allocator, query_alignment, storage_alignment);
     [[maybe_unused]] int ret = container->addPreprocessor(pp);
     assert(ret == 0 && "SQ8 preprocessor was not added correctly");
 
@@ -110,16 +113,20 @@ VecSimIndex *NewIndex(const VecSimParams *params, bool is_normalized) {
         VecSimFactory::NewAbstractInitParams(hnswParams, params->logCtx, is_normalized);
 
     if (hnswParams->quantType == VecSimQuant_SQ8) {
-        assert(hnswParams->type == VecSimType_FLOAT32 ||
-               hnswParams->type == VecSimType_FLOAT16 && "SQ8 supports FP32 and FP16 only");
-        assert(is_normalized || hnswParams->metric != VecSimMetric_Cosine &&
-                                    "Standalone SQ8 does not support cosine metric.");
+        if (hnswParams->type != VecSimType_FLOAT32 && hnswParams->type != VecSimType_FLOAT16) {
+            return NULL; // SQ8 supports FP32 and FP16 only.
+        }
 
-        const float *mean_ptr = static_cast<const float *>(hnswParams->quantParams);
         VecSimMetric metric = hnswParams->metric;
         if (is_normalized && metric == VecSimMetric_Cosine) {
             metric = VecSimMetric_IP;
         }
+
+        if (metric == VecSimMetric_Cosine) {
+            return NULL; // SQ8 does not support cosine metric.
+        }
+
+        const float *mean_ptr = static_cast<const float *>(hnswParams->quantParams);
 
         if (hnswParams->type == VecSimType_FLOAT32) {
             if (metric == VecSimMetric_L2) {
@@ -138,8 +145,6 @@ VecSimIndex *NewIndex(const VecSimParams *params, bool is_normalized) {
                                                               mean_ptr);
             }
         }
-
-        return NULL;
     }
 
     if (hnswParams->type == VecSimType_FLOAT32) {

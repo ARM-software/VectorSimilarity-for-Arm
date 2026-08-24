@@ -41,18 +41,33 @@ static inline BFParams NewBFParams(const TieredIndexParams *params) {
 template <typename DataType, typename DistType = DataType>
 inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
 
-    // initialize hnsw index
+    // Construct an accumulating SQ8 backend with its final normalized component and storage
+    // layout. The zero mean is replaced with the accumulated mean before jobs are submitted.
+    VecSimParams backend_params = *params->primaryIndexParams;
+    auto &hnsw_params = backend_params.algoParams.hnswParams;
+    std::vector<float> zero_mean;
+    if (hnsw_params.quantType != VecSimQuant_NONE &&
+        params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
+        zero_mean.resize(hnsw_params.dim, 0.0f);
+        hnsw_params.quantParams = zero_mean.data();
+    }
+
     // Normalization is done by the frontend index.
     auto *hnsw_index = reinterpret_cast<HNSWIndex<DataType, DistType> *>(
-        HNSWFactory::NewIndex(params->primaryIndexParams, true));
-    // initialize brute force index
+        HNSWFactory::NewIndex(&backend_params, true));
+    if (!hnsw_index) {
+        return nullptr;
+    }
 
+    // initialize brute force index
     BFParams bf_params = NewBFParams(params);
 
     AbstractIndexInitParams abstractInitParams =
         VecSimFactory::NewAbstractInitParams(&bf_params, params->primaryIndexParams->logCtx, false);
     assert(hnsw_index->getInputBlobSize() == abstractInitParams.storedDataSize);
-    assert(hnsw_index->getStoredDataSize() == abstractInitParams.storedDataSize);
+    if (hnsw_params.quantType == VecSimQuant_NONE) {
+        assert(hnsw_index->getStoredDataSize() == abstractInitParams.storedDataSize);
+    }
     auto frontendIndex = static_cast<BruteForceIndex<DataType, DistType> *>(
         BruteForceFactory::NewIndex(&bf_params, abstractInitParams, false));
 
@@ -67,9 +82,11 @@ inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
 inline size_t EstimateInitialSize(const TieredIndexParams *params) {
     HNSWParams hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
 
-    // Keep size estimation consistent with NewIndex, which rejects quantized tiered indexes.
-    if (hnsw_params.quantType != VecSimQuant_NONE) {
-        throw std::invalid_argument("Quantization is not supported for tiered HNSW indexes");
+    std::vector<float> zero_mean;
+    if (hnsw_params.quantType != VecSimQuant_NONE &&
+        params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
+        zero_mean.resize(hnsw_params.dim, 0.0f);
+        hnsw_params.quantParams = zero_mean.data();
     }
 
     // Add size estimation of VecSimTieredIndex sub indexes.
@@ -108,18 +125,8 @@ inline size_t EstimateInitialSize(const TieredIndexParams *params) {
 }
 
 VecSimIndex *NewIndex(const TieredIndexParams *params) {
-    // The brute-force frontend is not quantized, so an SQ8 primary index would use an incompatible
-    // stored-vector layout.
-    if (params->primaryIndexParams->algoParams.hnswParams.quantType != VecSimQuant_NONE) {
-        return nullptr;
-    }
-
     // Tiered index that contains HNSW index as primary index
     VecSimType type = params->primaryIndexParams->algoParams.hnswParams.type;
-    VecSimQuantType quantType = params->primaryIndexParams->algoParams.hnswParams.quantType;
-    if (quantType != VecSimQuant_NONE && type != VecSimType_FLOAT32 && type != VecSimType_FLOAT16) {
-        return nullptr;
-    }
     if (type == VecSimType_FLOAT32) {
         return TieredHNSWFactory::NewIndex<float>(params);
     } else if (type == VecSimType_FLOAT64) {
@@ -259,7 +266,14 @@ size_t EstimateElementSize(const TieredIndexParams *params) {
     // Match HNSW's element estimator, which leaves validation to NewIndex.
     size_t est = 0;
     if (params->primaryIndexParams->algo == VecSimAlgo_HNSWLIB) {
-        est = HNSWFactory::EstimateElementSize(&params->primaryIndexParams->algoParams.hnswParams);
+            HNSWParams hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
+            std::vector<float> zero_mean;
+            if (hnsw_params.quantType != VecSimQuant_NONE &&
+                params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
+                zero_mean.resize(hnsw_params.dim, 0.0f);
+                hnsw_params.quantParams = zero_mean.data();
+            }
+        est = HNSWFactory::EstimateElementSize(&hnsw_params);
     }
     if (params->primaryIndexParams->algo == VecSimAlgo_SVS) {
         est = SVSFactory::EstimateElementSize(&params->primaryIndexParams->algoParams.svsParams);

@@ -475,26 +475,11 @@ TYPED_TEST(HNSWSQ8Test, GraphConstructionIP) {
     runTopKSearchTest(this->index, query.data(), 10, verify);
 }
 
-// The tiered frontend does not propagate SQ8 settings, so creation and initial-size estimation must
-// reject quantization.
-TEST(HNSWSQ8TieredTest, RejectsQuantizedTieredIndex) {
-    HNSWParams hnsw_params = {.type = VecSimType_FLOAT32,
-                              .dim = 4,
-                              .metric = VecSimMetric_L2,
-                              .quantType = VecSimQuant_SQ8};
-    VecSimParams primary_params = CreateParams(hnsw_params);
-    // Rejection happens before the factory needs a job queue or thread pool.
-    TieredIndexParams tiered_params = {.primaryIndexParams = &primary_params};
-    VecSimParams params = CreateParams(tiered_params);
-
-    EXPECT_EQ(VecSimIndex_New(&params), nullptr);
-    EXPECT_EQ(EstimateInitialSize(tiered_params), SIZE_MAX);
-}
-
 /* ---------------------------- Tiered HNSW tests ---------------------------- */
 
 using HNSWSQ8TieredDataTypeSet =
     ::testing::Types<HNSWSQ8IndexType<VecSimType_FLOAT32, float, false>,
+                     HNSWSQ8IndexType<VecSimType_FLOAT32, float, true>,
                      HNSWSQ8IndexType<VecSimType_FLOAT16, vecsim_types::float16, false>>;
 
 template <typename index_type_t>
@@ -516,8 +501,9 @@ protected:
             .jobQueueCtx = mock_thread_pool.ctx,
             .submitCb = tieredIndexMock::submit_callback,
             .primaryIndexParams = &vecsim_hnsw_params,
-            .specificParams = {
-                TieredHNSWParams{.QuantNormalizationSetSize = normalization_set_size}}};
+            .specificParams = {TieredHNSWParams{
+                .QuantNormalizationSetSize =
+                    index_type_t::with_quant_params ? normalization_set_size : 0}}};
         VecSimParams vecsim_params = CreateParams(tiered_params);
         this->index = VecSimIndex_New(&vecsim_params);
         ASSERT_NE(this->index, nullptr);
@@ -537,7 +523,7 @@ protected:
 
 template <typename index_type_t>
 void SQ8TieredHNSWTest<index_type_t>::create_index_test() {
-    HNSWParams params = {.dim = 40, .M = 16, .efConstruction = 200};
+    HNSWParams params = {.dim = 40, .metric = VecSimMetric_IP, .M = 16, .efConstruction = 200};
     SetUp(params);
 
     ASSERT_EQ(VecSimIndex_IndexSize(this->index), 0u);
@@ -555,7 +541,8 @@ TYPED_TEST(SQ8TieredHNSWTest, CreateIndex) { this->create_index_test(); }
 
 TYPED_TEST(SQ8TieredHNSWTest, SizeEstimation) {
     constexpr size_t block_size = DEFAULT_BLOCK_SIZE;
-    HNSWParams hnsw_params = {.dim = 16, .initialCapacity = block_size, .M = 32};
+    HNSWParams hnsw_params = {
+        .dim = 16, .metric = VecSimMetric_IP, .initialCapacity = block_size, .M = 32};
     this->SetUp(hnsw_params);
 
     VecSimParams vecsim_hnsw_params = CreateParams(hnsw_params);
@@ -564,8 +551,9 @@ TYPED_TEST(SQ8TieredHNSWTest, SizeEstimation) {
         .jobQueueCtx = this->mock_thread_pool.ctx,
         .submitCb = tieredIndexMock::submit_callback,
         .primaryIndexParams = &vecsim_hnsw_params,
-        .specificParams = {
-            TieredHNSWParams{.QuantNormalizationSetSize = this->normalization_set_size}}};
+        .specificParams = {TieredHNSWParams{
+            .QuantNormalizationSetSize =
+                TypeParam::with_quant_params ? TestFixture::normalization_set_size : 0}}};
     VecSimParams params = CreateParams(tiered_params);
 
     EXPECT_EQ(VecSimIndex_EstimateInitialSize(&params), this->index->getAllocationSize());
@@ -601,8 +589,78 @@ TYPED_TEST(SQ8TieredHNSWTest, Override) { this->test_override(); }
 
 TYPED_TEST(SQ8TieredHNSWTest, RangeQuery) { this->test_range_query(); }
 
-TYPED_TEST(SQ8TieredHNSWTest, GetDistanceL2) { this->test_get_distance(VecSimMetric_L2); }
-
-TYPED_TEST(SQ8TieredHNSWTest, GetDistanceIP) { this->test_get_distance(VecSimMetric_IP); }
+TYPED_TEST(SQ8TieredHNSWTest, GetDistanceL2) { this->test_get_distance(VecSimMetric_L2, false); }
+TYPED_TEST(SQ8TieredHNSWTest, GetDistanceIP) { this->test_get_distance(VecSimMetric_IP, false); }
+TYPED_TEST(SQ8TieredHNSWTest, GetDistanceMultiL2) {
+    this->test_get_distance(VecSimMetric_L2, true);
+}
+TYPED_TEST(SQ8TieredHNSWTest, GetDistanceMultiIP) {
+    this->test_get_distance(VecSimMetric_IP, true);
+}
 
 TYPED_TEST(SQ8TieredHNSWTest, BatchIteratorBasic) { this->test_batch_iterator_basic(); }
+
+// SQ8 kernels support only FLOAT32 and FLOAT16 input vectors.
+TEST(SQ8TieredHNSWTest, RejectsUnsupportedDataType) {
+    for (auto type : {VecSimType_FLOAT64, VecSimType_BFLOAT16, VecSimType_INT8, VecSimType_UINT8}) {
+        HNSWParams hnsw_params = {
+            .type = type, .dim = 4, .metric = VecSimMetric_L2, .quantType = VecSimQuant_SQ8};
+        VecSimParams params = CreateParams(hnsw_params);
+        TieredIndexParams tiered_params = {
+            .primaryIndexParams = &params,
+            .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = 10}}};
+        VecSimParams vecsim_params = CreateParams(tiered_params);
+        EXPECT_EQ(VecSimIndex_New(&vecsim_params), nullptr) << "data type " << type;
+        EXPECT_EQ(EstimateInitialSize(tiered_params), SIZE_MAX) << "data type " << type;
+    }
+}
+
+// Value 3 has no VecSimMetric enumerator but is within the enum's representable range, so the
+// factory must reject it before dispatch.
+TEST(SQ8TieredHNSWTest, RejectsOutOfRangeMetric) {
+    HNSWParams hnsw_params = {.type = VecSimType_FLOAT32,
+                              .dim = 4,
+                              .metric = static_cast<VecSimMetric>(3),
+                              .quantType = VecSimQuant_SQ8};
+    VecSimParams params = CreateParams(hnsw_params);
+    TieredIndexParams tiered_params = {
+        .primaryIndexParams = &params,
+        .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = 10}}};
+    VecSimParams vecsim_params = CreateParams(tiered_params);
+    EXPECT_EQ(VecSimIndex_New(&vecsim_params), nullptr);
+    EXPECT_EQ(EstimateInitialSize(tiered_params), SIZE_MAX);
+}
+
+// Mean-centering a FLOAT16 L2 query can lose precision or overflow when it is narrowed back to
+// FLOAT16. Inner-product queries are not centered and remain supported.
+TEST(SQ8TieredHNSWTest, RejectsMeanCenteredFP16L2) {
+    std::vector<float> mean(4, 1.0f);
+
+    HNSWParams l2 = {.type = VecSimType_FLOAT16,
+                     .dim = 4,
+                     .metric = VecSimMetric_L2,
+                     .quantType = VecSimQuant_SQ8,
+                     .quantParams = mean.data()};
+    VecSimParams l2_params = CreateParams(l2);
+    TieredIndexParams l2_tiered_params = {
+        .primaryIndexParams = &l2_params,
+        .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = 10}}};
+    VecSimParams l2_vecsim_params = CreateParams(l2_tiered_params);
+    EXPECT_EQ(VecSimIndex_New(&l2_vecsim_params), nullptr);
+    EXPECT_EQ(EstimateInitialSize(l2_tiered_params), SIZE_MAX);
+
+    HNSWParams ip = {.type = VecSimType_FLOAT16,
+                     .dim = 4,
+                     .metric = VecSimMetric_IP,
+                     .quantType = VecSimQuant_SQ8,
+                     .quantParams = mean.data()};
+    VecSimParams ip_params = CreateParams(ip);
+    TieredIndexParams ip_tiered_params = {
+        .primaryIndexParams = &ip_params,
+        .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = 10}}};
+    VecSimParams ip_vecsim_params = CreateParams(ip_tiered_params);
+    VecSimIndex *ip_index = VecSimIndex_New(&ip_vecsim_params);
+    ASSERT_NE(ip_index, nullptr);
+    VecSimIndex_Free(ip_index);
+    EXPECT_NE(EstimateInitialSize(ip_tiered_params), SIZE_MAX);
+}

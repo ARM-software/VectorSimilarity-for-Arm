@@ -18,11 +18,15 @@
 #include "unit_test_utils.h"
 
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <random>
+#include <thread>
 #include <type_traits>
+#include <unordered_set>
 
 template <VecSimType type, typename DataType, bool WithQuantParams>
 struct HNSWSQ8IndexType : IndexType<type, DataType, float> {
@@ -599,6 +603,322 @@ TYPED_TEST(SQ8TieredHNSWTest, GetDistanceMultiIP) {
 }
 
 TYPED_TEST(SQ8TieredHNSWTest, BatchIteratorBasic) { this->test_batch_iterator_basic(); }
+
+namespace {
+struct MigrationQuerySubmitContext {
+    tieredIndexMock *mock_thread_pool;
+    VecSimIndex *index;
+    const void *query;
+    size_t queued_jobs_after_migration = 0;
+    bool query_succeeded = false;
+};
+
+int executeOneMigrationThenQuery(void *, void *index_ctx, AsyncJob **jobs, JobCallback *callbacks,
+                                 size_t jobs_len) {
+    auto *context = static_cast<MigrationQuerySubmitContext *>(index_ctx);
+    const int status =
+        context->mock_thread_pool->submit_callback_internal(jobs, callbacks, jobs_len);
+    if (status != VecSim_OK) {
+        return status;
+    }
+
+    context->mock_thread_pool->thread_iteration();
+    context->queued_jobs_after_migration = context->mock_thread_pool->jobQ.size();
+
+    auto *reply = VecSimIndex_TopKQuery(context->index, context->query, 2, nullptr, BY_SCORE);
+    context->query_succeeded = reply && reply->code == VecSim_QueryReply_OK &&
+                               VecSimQueryReply_Len(reply) == 2;
+    VecSimQueryReply_Free(reply);
+    return VecSim_OK;
+}
+} // namespace
+
+TEST(SQ8TieredHNSWTest, QueryDuringSubmissionCallbackAfterOneMigration) {
+    constexpr size_t dim = 4;
+    HNSWParams hnsw_params = {.type = VecSimType_FLOAT32,
+                              .dim = dim,
+                              .metric = VecSimMetric_L2,
+                              .quantType = VecSimQuant_SQ8};
+    VecSimParams primary_index_params = CreateParams(hnsw_params);
+    tieredIndexMock mock_thread_pool;
+    float first_vector[dim] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float second_vector[dim] = {2.0f, 2.0f, 2.0f, 2.0f};
+    MigrationQuerySubmitContext submit_context = {
+        .mock_thread_pool = &mock_thread_pool, .query = second_vector};
+    TieredIndexParams tiered_params = {
+        .jobQueue = &mock_thread_pool.jobQ,
+        .jobQueueCtx = &submit_context,
+        .submitCb = executeOneMigrationThenQuery,
+        .primaryIndexParams = &primary_index_params,
+        .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = 2}}};
+    VecSimParams params = CreateParams(tiered_params);
+    auto *index = VecSimIndex_New(&params);
+    ASSERT_NE(index, nullptr);
+    submit_context.index = index;
+    mock_thread_pool.ctx->index_strong_ref.reset(index);
+
+    ASSERT_EQ(VecSimIndex_AddVector(index, first_vector, 0), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, second_vector, 1), 1);
+    EXPECT_EQ(submit_context.queued_jobs_after_migration, 1);
+    EXPECT_TRUE(submit_context.query_succeeded);
+
+    while (!mock_thread_pool.jobQ.empty()) {
+        mock_thread_pool.thread_iteration();
+    }
+
+    auto allocator = index->getAllocator();
+    mock_thread_pool.reset_ctx();
+}
+
+TEST(SQ8TieredHNSWTest, BatchIteratorDoesNotRepeatLabelsDuringMigrationOverlap) {
+    constexpr size_t dim = 4;
+    constexpr size_t normalization_set_size = 4;
+    HNSWParams hnsw_params = {.type = VecSimType_FLOAT32,
+                              .dim = dim,
+                              .metric = VecSimMetric_L2,
+                              .quantType = VecSimQuant_SQ8};
+    VecSimParams primary_index_params = CreateParams(hnsw_params);
+    tieredIndexMock mock_thread_pool;
+    TieredIndexParams tiered_params = {
+        .jobQueue = &mock_thread_pool.jobQ,
+        .jobQueueCtx = mock_thread_pool.ctx,
+        .submitCb = tieredIndexMock::submit_callback,
+        .primaryIndexParams = &primary_index_params,
+        .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = normalization_set_size}}};
+    VecSimParams params = CreateParams(tiered_params);
+    auto *index = VecSimIndex_New(&params);
+    ASSERT_NE(index, nullptr);
+    mock_thread_pool.ctx->index_strong_ref.reset(index);
+
+    auto *tiered_index = dynamic_cast<TieredHNSWIndex<float, float> *>(index);
+    ASSERT_NE(tiered_index, nullptr);
+
+    float vectors[normalization_set_size][dim] = {
+        {1.0f, 1.0f, 1.0f, 1.0f},
+        {2.0f, 2.0f, 2.0f, 2.0f},
+        {3.0f, 3.0f, 3.0f, 3.0f},
+        {4.0f, 4.0f, 4.0f, 4.0f},
+    };
+    for (size_t label = 0; label < normalization_set_size - 1; label++) {
+        ASSERT_EQ(VecSimIndex_AddVector(index, vectors[label], label), 1);
+    }
+
+    std::mutex overlap_mutex;
+    std::condition_variable overlap_cv;
+    bool backend_inserted = false;
+    bool allow_flat_removal = false;
+    tiered_index->setAfterBackendInsertBeforeFlatRemovalHook([&] {
+        std::unique_lock lock(overlap_mutex);
+        backend_inserted = true;
+        overlap_cv.notify_all();
+        overlap_cv.wait(lock, [&] { return allow_flat_removal; });
+    });
+
+    ASSERT_EQ(VecSimIndex_AddVector(index, vectors[normalization_set_size - 1],
+                                    normalization_set_size - 1),
+              1);
+    std::thread migration_worker([&] { mock_thread_pool.thread_iteration(); });
+    bool overlap_reached = false;
+    {
+        std::unique_lock lock(overlap_mutex);
+        overlap_reached = overlap_cv.wait_for(lock, std::chrono::seconds(10),
+                                              [&] { return backend_inserted; });
+    }
+    EXPECT_TRUE(overlap_reached);
+
+    VecSimBatchIterator *iterator = VecSimBatchIterator_New(index, vectors[0], nullptr);
+    EXPECT_NE(iterator, nullptr);
+    if (iterator) {
+        std::unordered_set<labelType> returned_labels;
+        size_t batch_count = 0;
+        while (VecSimBatchIterator_HasNext(iterator)) {
+            auto *batch = VecSimBatchIterator_Next(iterator, 1, BY_SCORE);
+            EXPECT_NE(batch, nullptr);
+            if (!batch) {
+                break;
+            }
+            for (const auto &result : batch->results) {
+                EXPECT_TRUE(returned_labels.insert(VecSimQueryResult_GetId(&result)).second);
+            }
+            VecSimQueryReply_Free(batch);
+            if (++batch_count > normalization_set_size) {
+                ADD_FAILURE() << "batch iterator did not deplete";
+                break;
+            }
+        }
+        EXPECT_EQ(batch_count, normalization_set_size);
+        EXPECT_EQ(returned_labels.size(), normalization_set_size);
+        VecSimBatchIterator_Free(iterator);
+    }
+
+    {
+        std::lock_guard lock(overlap_mutex);
+        allow_flat_removal = true;
+    }
+    overlap_cv.notify_all();
+    migration_worker.join();
+    while (!mock_thread_pool.jobQ.empty()) {
+        mock_thread_pool.thread_iteration();
+    }
+
+    auto allocator = index->getAllocator();
+    mock_thread_pool.reset_ctx();
+}
+
+TEST(SQ8TieredHNSWTest, BatchIteratorCreatedBeforeNormalizationSeesMigratedLabels) {
+    constexpr size_t dim = 4;
+    constexpr size_t normalization_set_size = 4;
+    HNSWParams hnsw_params = {.type = VecSimType_FLOAT32,
+                              .dim = dim,
+                              .metric = VecSimMetric_L2,
+                              .quantType = VecSimQuant_SQ8};
+    VecSimParams primary_index_params = CreateParams(hnsw_params);
+    tieredIndexMock mock_thread_pool;
+    TieredIndexParams tiered_params = {
+        .jobQueue = &mock_thread_pool.jobQ,
+        .jobQueueCtx = mock_thread_pool.ctx,
+        .submitCb = tieredIndexMock::submit_callback,
+        .primaryIndexParams = &primary_index_params,
+        .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = normalization_set_size}}};
+    VecSimParams params = CreateParams(tiered_params);
+    auto *index = VecSimIndex_New(&params);
+    ASSERT_NE(index, nullptr);
+    mock_thread_pool.ctx->index_strong_ref.reset(index);
+
+    float vectors[normalization_set_size][dim] = {
+        {1.0f, 1.0f, 1.0f, 1.0f},
+        {2.0f, 2.0f, 2.0f, 2.0f},
+        {3.0f, 3.0f, 3.0f, 3.0f},
+        {4.0f, 4.0f, 4.0f, 4.0f},
+    };
+    for (size_t label = 0; label < normalization_set_size - 1; label++) {
+        ASSERT_EQ(VecSimIndex_AddVector(index, vectors[label], label), 1);
+    }
+
+    VecSimBatchIterator *iterator = VecSimBatchIterator_New(index, vectors[0], nullptr);
+    ASSERT_NE(iterator, nullptr);
+
+    ASSERT_EQ(VecSimIndex_AddVector(index, vectors[normalization_set_size - 1],
+                                    normalization_set_size - 1),
+              1);
+    while (!mock_thread_pool.jobQ.empty()) {
+        mock_thread_pool.thread_iteration();
+    }
+
+    std::unordered_set<labelType> returned_labels;
+    size_t batch_count = 0;
+    while (VecSimBatchIterator_HasNext(iterator)) {
+        auto *batch = VecSimBatchIterator_Next(iterator, 1, BY_SCORE);
+        ASSERT_NE(batch, nullptr);
+        const size_t batch_len = VecSimQueryReply_Len(batch);
+        if (batch_len == 0) {
+            VecSimQueryReply_Free(batch);
+            break;
+        }
+        ASSERT_EQ(batch_len, 1);
+        for (const auto &result : batch->results) {
+            EXPECT_TRUE(returned_labels.insert(VecSimQueryResult_GetId(&result)).second);
+        }
+        VecSimQueryReply_Free(batch);
+        ASSERT_LE(++batch_count, normalization_set_size);
+    }
+    for (labelType label = 0; label < normalization_set_size - 1; label++) {
+        EXPECT_NE(returned_labels.find(label), returned_labels.end());
+    }
+    VecSimBatchIterator_Free(iterator);
+
+    auto allocator = index->getAllocator();
+    mock_thread_pool.reset_ctx();
+}
+
+TEST(SQ8TieredHNSWTest, ConcurrentQueriesDuringNormalizationTransition) {
+    constexpr size_t dim = 4;
+    constexpr size_t normalization_set_size = 2;
+    HNSWParams hnsw_params = {.type = VecSimType_FLOAT32,
+                              .dim = dim,
+                              .metric = VecSimMetric_L2,
+                              .quantType = VecSimQuant_SQ8};
+    VecSimParams primary_index_params = CreateParams(hnsw_params);
+    tieredIndexMock mock_thread_pool;
+    TieredIndexParams tiered_params = {
+        .jobQueue = &mock_thread_pool.jobQ,
+        .jobQueueCtx = mock_thread_pool.ctx,
+        .submitCb = tieredIndexMock::submit_callback,
+        .primaryIndexParams = &primary_index_params,
+        .specificParams = {TieredHNSWParams{.QuantNormalizationSetSize = normalization_set_size}}};
+    VecSimParams params = CreateParams(tiered_params);
+    auto *index = VecSimIndex_New(&params);
+    ASSERT_NE(index, nullptr);
+    mock_thread_pool.ctx->index_strong_ref.reset(index);
+
+    auto *tiered_index = dynamic_cast<TieredHNSWIndex<float, float> *>(index);
+    ASSERT_NE(tiered_index, nullptr);
+
+    float first_vector[dim] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float second_vector[dim] = {2.0f, 2.0f, 2.0f, 2.0f};
+    float query[dim] = {1.0f, 1.0f, 1.0f, 1.0f};
+    ASSERT_EQ(VecSimIndex_AddVector(index, first_vector, 0), 1);
+
+    std::mutex transition_mutex;
+    std::condition_variable transition_cv;
+    bool replacement_entered = false;
+    bool allow_replacement = false;
+    tiered_index->setBeforeQuantizedBackendReplacementHook([&] {
+        std::unique_lock lock(transition_mutex);
+        replacement_entered = true;
+        transition_cv.notify_all();
+        transition_cv.wait(lock, [&] { return allow_replacement; });
+    });
+
+    std::thread writer([&] { EXPECT_EQ(VecSimIndex_AddVector(index, second_vector, 1), 1); });
+    {
+        std::unique_lock lock(transition_mutex);
+        ASSERT_TRUE(transition_cv.wait_for(lock, std::chrono::seconds(10),
+                                           [&] { return replacement_entered; }));
+    }
+
+    std::thread top_k_reader([&] {
+        auto *reply = VecSimIndex_TopKQuery(index, query, 2, nullptr, BY_SCORE);
+        ASSERT_NE(reply, nullptr);
+        EXPECT_EQ(reply->code, VecSim_QueryReply_OK);
+        EXPECT_EQ(VecSimQueryReply_Len(reply), normalization_set_size);
+        VecSimQueryReply_Free(reply);
+    });
+    std::thread range_reader([&] {
+        auto *reply = VecSimIndex_RangeQuery(index, query, 100.0, nullptr, BY_SCORE);
+        ASSERT_NE(reply, nullptr);
+        EXPECT_EQ(reply->code, VecSim_QueryReply_OK);
+        EXPECT_EQ(VecSimQueryReply_Len(reply), normalization_set_size);
+        VecSimQueryReply_Free(reply);
+    });
+    std::thread ad_hoc_reader(
+        [&] { (void)VecSimIndex_PreferAdHocSearch(index, normalization_set_size, 1, true); });
+
+    top_k_reader.join();
+    range_reader.join();
+    ad_hoc_reader.join();
+
+    {
+        std::lock_guard lock(transition_mutex);
+        allow_replacement = true;
+    }
+    transition_cv.notify_all();
+    writer.join();
+
+    while (!mock_thread_pool.jobQ.empty()) {
+        mock_thread_pool.thread_iteration();
+    }
+
+    auto *reply = VecSimIndex_TopKQuery(index, query, 2, nullptr, BY_SCORE);
+    ASSERT_NE(reply, nullptr);
+    EXPECT_EQ(reply->code, VecSim_QueryReply_OK);
+    EXPECT_EQ(VecSimQueryReply_Len(reply), normalization_set_size);
+    VecSimQueryReply_Free(reply);
+
+    // Keep the allocator alive while reset_ctx releases the index's final reference.
+    auto allocator = index->getAllocator();
+    mock_thread_pool.reset_ctx();
+}
 
 // SQ8 kernels support only FLOAT32 and FLOAT16 input vectors.
 TEST(SQ8TieredHNSWTest, RejectsUnsupportedDataType) {

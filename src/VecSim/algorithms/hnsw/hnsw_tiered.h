@@ -11,6 +11,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <optional>
 
 #include "VecSim/algorithms/brute_force/brute_force_single.h"
@@ -121,6 +122,11 @@ private:
             : runningSumVec(allocator), backendIndexParams(params) {}
     };
     std::optional<SQAccumulationState> sqAccumulationState;
+
+#ifdef BUILD_TESTS
+    std::function<void()> beforeQuantizedBackendReplacement;
+    std::function<void()> afterBackendInsertBeforeFlatRemoval;
+#endif
 
     void initializeQuantizedBackend();
 
@@ -257,6 +263,16 @@ public:
                     const TieredIndexParams &tieredParams,
                     std::shared_ptr<VecSimAllocator> allocator);
     virtual ~TieredHNSWIndex();
+
+#ifdef BUILD_TESTS
+    void setBeforeQuantizedBackendReplacementHook(std::function<void()> hook) {
+        beforeQuantizedBackendReplacement = std::move(hook);
+    }
+
+    void setAfterBackendInsertBeforeFlatRemovalHook(std::function<void()> hook) {
+        afterBackendInsertBeforeFlatRemoval = std::move(hook);
+    }
+#endif
 
     // Override query routing so that for quantized tiered indices the flat+backend
     // merge always uses withSet=true (the flat and quantized backend scores are not
@@ -654,6 +670,12 @@ void TieredHNSWIndex<DataType, DistType>::executeInsertJob(HNSWInsertJob *job) {
 
     this->insertVectorToHNSW<true>(hnsw_index, job->label, blob_copy.get());
 
+#ifdef BUILD_TESTS
+    if (afterBackendInsertBeforeFlatRemoval) {
+        afterBackendInsertBeforeFlatRemoval();
+    }
+#endif
+
     // Remove the vector and the insert job from the flat buffer.
     this->flatIndexGuard.lock();
     // The job might have been invalidated due to overwrite in the meantime. In this case,
@@ -868,6 +890,11 @@ void TieredHNSWIndex<DataType, DistType>::initializeQuantizedBackend() {
         // The backend is constructed with normalized frontend blobs, so cosine is resolved to IP.
         const auto metric = accumulationState.backendIndexParams.algoParams.hnswParams.metric;
         this->lockMainIndexGuard();
+    #ifdef BUILD_TESTS
+        if (beforeQuantizedBackendReplacement) {
+            beforeQuantizedBackendReplacement();
+        }
+    #endif
         if (metric == VecSimMetric_L2) {
             this->getHNSWIndex()->replaceComponents(
                 CreateSQ8IndexComponents<DataType, VecSimMetric_L2>(this->allocator, dim,

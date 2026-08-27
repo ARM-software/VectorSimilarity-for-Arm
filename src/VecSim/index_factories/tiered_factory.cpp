@@ -41,13 +41,13 @@ static inline BFParams NewBFParams(const TieredIndexParams *params) {
 template <typename DataType, typename DistType = DataType>
 inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
 
-    // Construct an accumulating SQ8 backend with its final normalized component and storage
-    // layout. The zero mean is replaced with the accumulated mean before jobs are submitted.
     VecSimParams backend_params = *params->primaryIndexParams;
     auto &hnsw_params = backend_params.algoParams.hnswParams;
     std::vector<float> zero_mean;
     if (hnsw_params.quantType != VecSimQuant_NONE &&
         params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
+        // Construct an SQ8 with norm backend by setting quantParams to not NULL
+        // Components are replaced with the accumulated mean before jobs are submitted.
         zero_mean.resize(hnsw_params.dim, 0.0f);
         hnsw_params.quantParams = zero_mean.data();
     }
@@ -56,6 +56,7 @@ inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
     auto *hnsw_index = reinterpret_cast<HNSWIndex<DataType, DistType> *>(
         HNSWFactory::NewIndex(&backend_params, true));
     if (!hnsw_index) {
+        // Unsupported SQ8 parameters will be rejected by the HNSWFactory::NewIndex
         return nullptr;
     }
 
@@ -81,20 +82,27 @@ inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
 
 inline size_t EstimateInitialSize(const TieredIndexParams *params) {
     HNSWParams hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
+    VecSimQuantType quantType = hnsw_params.quantType;
+    size_t normSize = params->specificParams.tieredHnswParams.QuantNormalizationSetSize;
+
+    size_t est = 0;
+    size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
 
     std::vector<float> zero_mean;
-    if (hnsw_params.quantType != VecSimQuant_NONE &&
-        params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
-        zero_mean.resize(hnsw_params.dim, 0.0f);
-        hnsw_params.quantParams = zero_mean.data();
+    if (quantType != VecSimQuant_NONE && normSize > 0) {
+        // Add size of SQ accumulation buffer
+        est += allocations_overhead + hnsw_params.dim * sizeof(float);
+
+        // Set quantParams non-null to indicate HNSW SQ8 with_norm index
+        static char dummy;
+        hnsw_params.quantParams = &dummy;
     }
 
     // Add size estimation of VecSimTieredIndex sub indexes.
     // Normalization is done by the frontend index.
-    size_t est = HNSWFactory::EstimateInitialSize(&hnsw_params, true);
+    est += HNSWFactory::EstimateInitialSize(&hnsw_params, true);
 
     // Management layer allocator overhead.
-    size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
     est += sizeof(VecSimAllocator) + allocations_overhead;
 
     // Size of the TieredHNSWIndex struct.
@@ -112,13 +120,6 @@ inline size_t EstimateInitialSize(const TieredIndexParams *params) {
         est += sizeof(TieredHNSWIndex<uint8_t, float>);
     } else {
         throw std::invalid_argument("Invalid hnsw_params.type");
-    }
-
-    VecSimQuantType quantType = hnsw_params.quantType;
-    size_t normSize = params->specificParams.tieredHnswParams.QuantNormalizationSetSize;
-    if (quantType != VecSimQuant_NONE && normSize > 0) {
-        // Add size of SQ accumulation buffer
-        est += allocations_overhead + hnsw_params.dim * sizeof(float);
     }
 
     return est;
@@ -266,13 +267,14 @@ size_t EstimateElementSize(const TieredIndexParams *params) {
     // Match HNSW's element estimator, which leaves validation to NewIndex.
     size_t est = 0;
     if (params->primaryIndexParams->algo == VecSimAlgo_HNSWLIB) {
-            HNSWParams hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
-            std::vector<float> zero_mean;
-            if (hnsw_params.quantType != VecSimQuant_NONE &&
-                params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
-                zero_mean.resize(hnsw_params.dim, 0.0f);
-                hnsw_params.quantParams = zero_mean.data();
-            }
+        HNSWParams hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
+        if (hnsw_params.quantType != VecSimQuant_NONE &&
+            params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
+
+            // Set quantParams non-null to indicate HNSW SQ8 with_norm index
+            static char dummy;
+            hnsw_params.quantParams = &dummy;
+        }
         est = HNSWFactory::EstimateElementSize(&hnsw_params);
     }
     if (params->primaryIndexParams->algo == VecSimAlgo_SVS) {

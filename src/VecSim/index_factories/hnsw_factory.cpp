@@ -43,15 +43,6 @@ template <VecSimMetric Metric>
                      : sq8::storage_bytes_count<Metric, false>(dim);
 }
 
-// Asymmetric dispatch reports alignment for the stored operand only. Ask the query type's
-// dispatcher for the query allocation alignment.
-template <typename DataType>
-[[nodiscard]] unsigned char GetQueryAlignment(VecSimMetric metric, size_t dim) {
-    unsigned char alignment = 0;
-    spaces::GetDistFunc<DataType, float>(metric, dim, &alignment);
-    return alignment;
-}
-
 // Cosine over pre-normalized vectors is computed as inner product.
 [[nodiscard]] constexpr VecSimMetric ResolveSQ8Metric(VecSimMetric metric, bool is_normalized) {
     return (is_normalized && metric == VecSimMetric_Cosine) ? VecSimMetric_IP : metric;
@@ -84,9 +75,8 @@ VecSimIndex *NewIndex_SQ8(const HNSWParams *hnswParams, AbstractIndexInitParams 
         GetSQ8StoredDataSize<Metric>(abstractInitParams.dim, with_norm);
     abstractInitParams.isQuantized = true;
 
-    IndexComponents<DataType, float> components =
-        CreateSQ8IndexComponents<DataType, Metric>(abstractInitParams.allocator,
-                                                   abstractInitParams.dim, mean_ptr);
+    IndexComponents<DataType, float> components = CreateSQ8IndexComponents<DataType, Metric>(
+        abstractInitParams.allocator, abstractInitParams.dim, mean_ptr);
     return NewIndex_ChooseMultiOrSingle<DataType, float>(hnswParams, abstractInitParams,
                                                          components);
 }

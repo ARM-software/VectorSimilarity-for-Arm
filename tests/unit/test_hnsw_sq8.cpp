@@ -626,8 +626,8 @@ int executeOneMigrationThenQuery(void *, void *index_ctx, AsyncJob **jobs, JobCa
     context->queued_jobs_after_migration = context->mock_thread_pool->jobQ.size();
 
     auto *reply = VecSimIndex_TopKQuery(context->index, context->query, 2, nullptr, BY_SCORE);
-    context->query_succeeded = reply && reply->code == VecSim_QueryReply_OK &&
-                               VecSimQueryReply_Len(reply) == 2;
+    context->query_succeeded =
+        reply && reply->code == VecSim_QueryReply_OK && VecSimQueryReply_Len(reply) == 2;
     VecSimQueryReply_Free(reply);
     return VecSim_OK;
 }
@@ -643,8 +643,8 @@ TEST(SQ8TieredHNSWTest, QueryDuringSubmissionCallbackAfterOneMigration) {
     tieredIndexMock mock_thread_pool;
     float first_vector[dim] = {1.0f, 1.0f, 1.0f, 1.0f};
     float second_vector[dim] = {2.0f, 2.0f, 2.0f, 2.0f};
-    MigrationQuerySubmitContext submit_context = {
-        .mock_thread_pool = &mock_thread_pool, .query = second_vector};
+    MigrationQuerySubmitContext submit_context = {.mock_thread_pool = &mock_thread_pool,
+                                                  .query = second_vector};
     TieredIndexParams tiered_params = {
         .jobQueue = &mock_thread_pool.jobQ,
         .jobQueueCtx = &submit_context,
@@ -694,10 +694,10 @@ TEST(SQ8TieredHNSWTest, BatchIteratorDoesNotRepeatLabelsDuringMigrationOverlap) 
     ASSERT_NE(tiered_index, nullptr);
 
     float vectors[normalization_set_size][dim] = {
-        {1.0f, 1.0f, 1.0f, 1.0f},
-        {2.0f, 2.0f, 2.0f, 2.0f},
-        {3.0f, 3.0f, 3.0f, 3.0f},
-        {4.0f, 4.0f, 4.0f, 4.0f},
+        {7.0f, 1.5f, 6.66f, 1.11f},
+        {2.0f, 2.22f, 2.0f, 3.33f},
+        {3.0f, 3.33f, 4.0f, 4.44f},
+        {4.44f, 5.66f, 5.0f, 5.55f},
     };
     for (size_t label = 0; label < normalization_set_size - 1; label++) {
         ASSERT_EQ(VecSimIndex_AddVector(index, vectors[label], label), 1);
@@ -721,8 +721,8 @@ TEST(SQ8TieredHNSWTest, BatchIteratorDoesNotRepeatLabelsDuringMigrationOverlap) 
     bool overlap_reached = false;
     {
         std::unique_lock lock(overlap_mutex);
-        overlap_reached = overlap_cv.wait_for(lock, std::chrono::seconds(10),
-                                              [&] { return backend_inserted; });
+        overlap_reached =
+            overlap_cv.wait_for(lock, std::chrono::seconds(10), [&] { return backend_inserted; });
     }
     EXPECT_TRUE(overlap_reached);
 

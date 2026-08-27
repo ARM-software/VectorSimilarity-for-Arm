@@ -107,18 +107,14 @@ private:
     size_t directHNSWInsertions{0};
 
     bool isQuantized{false};
-
-    // Query-visible state and configuration that outlive SQ accumulation.
     size_t quantNormalizationSetSize;
     std::atomic_bool isInAccumulationPhase;
 
-    // Main-thread-only scratch data used while accumulating vectors for SQ initialization.
     struct SQAccumulationState {
         vecsim_stl::vector<float> runningSumVec;
         VecSimParams backendIndexParams;
 
-        SQAccumulationState(std::shared_ptr<VecSimAllocator> allocator,
-                            const VecSimParams &params)
+        SQAccumulationState(std::shared_ptr<VecSimAllocator> allocator, const VecSimParams &params)
             : runningSumVec(allocator), backendIndexParams(params) {}
     };
     std::optional<SQAccumulationState> sqAccumulationState;
@@ -128,7 +124,7 @@ private:
     std::function<void()> afterBackendInsertBeforeFlatRemoval;
 #endif
 
-    void initializeQuantizedBackend();
+    void updateQuantizedBackend();
 
     void executeInsertJob(HNSWInsertJob *job);
     void executeRepairJob(HNSWRepairJob *job);
@@ -783,7 +779,7 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSWIndex(HNSWIndex<DataType, DistTyp
     : VecSimTieredIndex<DataType, DistType>(hnsw_index, bf_index, tiered_index_params, allocator),
       labelToInsertJobs(this->allocator), idToRepairJobs(this->allocator),
       idToSwapJob(this->allocator), invalidJobs(this->allocator), currInvalidJobId(0),
-    readySwapJobs(0), quantNormalizationSetSize(0), isInAccumulationPhase(false) {
+      readySwapJobs(0), quantNormalizationSetSize(0), isInAccumulationPhase(false) {
     // If the param for swapJobThreshold is 0 use the default value, if it exceeds the maximum
     // allowed, use the maximum value.
     this->pendingSwapJobsThreshold =
@@ -874,37 +870,35 @@ TieredHNSWIndex<DataType, DistType>::rangeQuery(const void *queryBlob, double ra
 }
 
 template <typename DataType, typename DistType>
-void TieredHNSWIndex<DataType, DistType>::initializeQuantizedBackend() {
+void TieredHNSWIndex<DataType, DistType>::updateQuantizedBackend() {
     if constexpr (!std::is_same_v<DistType, float> ||
-         !(std::is_same_v<DataType, float> || std::is_same_v<DataType, vecsim_types::float16>)) {
+                  !(std::is_same_v<DataType, float> ||
+                    std::is_same_v<DataType, vecsim_types::float16>)) {
         return;
     } else {
-        // Compute the mean that replaces the zero mean used while accumulating vectors.
         auto &accumulationState = *this->sqAccumulationState;
-        size_t dim = accumulationState.backendIndexParams.algoParams.hnswParams.dim;
-        vecsim_stl::vector<float> mean(dim, this->allocator);
-        for (size_t i = 0; i < dim; i++) {
+        auto &hnswParams = accumulationState.backendIndexParams.algoParams.hnswParams;
+        vecsim_stl::vector<float> mean(hnswParams.dim, this->allocator);
+        for (size_t i = 0; i < hnswParams.dim; i++) {
             mean[i] = accumulationState.runningSumVec[i] / this->quantNormalizationSetSize;
         }
 
-        // The backend is constructed with normalized frontend blobs, so cosine is resolved to IP.
-        const auto metric = accumulationState.backendIndexParams.algoParams.hnswParams.metric;
-        this->lockMainIndexGuard();
-    #ifdef BUILD_TESTS
+#ifdef BUILD_TESTS
         if (beforeQuantizedBackendReplacement) {
             beforeQuantizedBackendReplacement();
         }
-    #endif
-        if (metric == VecSimMetric_L2) {
+#endif
+
+        // The backend is constructed with normalized frontend blobs, so cosine is resolved to IP.
+        if (hnswParams.metric == VecSimMetric_L2) {
             this->getHNSWIndex()->replaceComponents(
-                CreateSQ8IndexComponents<DataType, VecSimMetric_L2>(this->allocator, dim,
-                                                                        mean.data()));
+                CreateSQ8IndexComponents<DataType, VecSimMetric_L2>(this->allocator, hnswParams.dim,
+                                                                    mean.data()));
         } else {
             this->getHNSWIndex()->replaceComponents(
-                CreateSQ8IndexComponents<DataType, VecSimMetric_IP>(this->allocator, dim,
-                                                                        mean.data()));
+                CreateSQ8IndexComponents<DataType, VecSimMetric_IP>(this->allocator, hnswParams.dim,
+                                                                    mean.data()));
         }
-        this->unlockMainIndexGuard();
         this->sqAccumulationState.reset();
     }
 }
@@ -1042,8 +1036,8 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
         this->submitSingleJob(new_insert_job);
     } else if (this->frontendIndex->indexSize() >= this->quantNormalizationSetSize) {
         // If we are in the accumulation phase and we just reached the quantization set size, we
-        // can initialize the backend index and transition to the regular mode.
-        this->initializeQuantizedBackend();
+        // can update the backend index with accumulated mean and transition to the regular mode.
+        this->updateQuantizedBackend();
         this->isInAccumulationPhase.store(false, std::memory_order_release);
 
         // Submit all pending insert jobs to the job queue.

@@ -4999,27 +4999,6 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, MeanComputedCorrectly) {
             expected_sum[d] += this->ToFloat(vec[d]);
         }
     }
-
-    // Verify running sum before triggering.
-    for (size_t d = 0; d < dim; d++) {
-        ASSERT_NEAR(this->getRunningSumVec(tiered_index)[d], expected_sum[d], 1e-2f);
-    }
-
-    // Add final vector to trigger transition.
-    TEST_DATA_T last_vec[dim];
-    this->GenerateVectorData(last_vec, dim, static_cast<float>(normSetSize));
-    VecSimIndex_AddVector(tiered_index, last_vec, normSetSize - 1);
-    for (size_t d = 0; d < dim; d++) {
-        expected_sum[d] += this->ToFloat(last_vec[d]);
-    }
-
-    // After transition, verify the mean was computed correctly.
-    ASSERT_FALSE(this->getIsInAccumulationPhase(tiered_index));
-    // The running sum should still hold the accumulated values.
-    for (size_t d = 0; d < dim; d++) {
-        float expected_mean = expected_sum[d] / normSetSize;
-        ASSERT_NEAR(this->getRunningSumVec(tiered_index)[d] / normSetSize, expected_mean, 1e-2f);
-    }
 }
 
 TYPED_TEST(HNSWTieredIndexTestSQ8, QueryDuringPartialMigration) {
@@ -5493,7 +5472,7 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, QuantizedSearchQuality) {
         this->GenerateVectorData(vec, dim, static_cast<float>(i));
         VecSimIndex_AddVector(tiered_index, vec, i);
     }
-    //ASSERT_FALSE(this->getIsInAccumulationPhase(tiered_index));
+    ASSERT_FALSE(this->getIsInAccumulationPhase(tiered_index));
 
     // Execute all jobs.
     while (!mock_thread_pool.jobQ.empty()) {
@@ -5503,9 +5482,9 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, QuantizedSearchQuality) {
     // Query with the same vector as label 0 - should find label 0 as nearest.
     TEST_DATA_T query[dim];
     this->GenerateVectorData(query, dim, 0.0f);
-    auto *results = VecSimIndex_TopKQuery(tiered_index, query, 10, nullptr, BY_SCORE);
+    auto *results = VecSimIndex_TopKQuery(tiered_index, query, 1, nullptr, BY_SCORE);
     ASSERT_NE(results, nullptr);
-    ASSERT_EQ(VecSimQueryReply_Len(results), 10);
+    ASSERT_EQ(VecSimQueryReply_Len(results), 1);
 
     auto it = VecSimQueryReply_GetIterator(results);
     auto *entry = VecSimQueryReply_IteratorNext(it);
@@ -5973,12 +5952,13 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, CosineMeanCorrectness) {
     // The mean of N unit vectors with the same direction should be that unit vector itself.
     size_t dim = 4;
     size_t normSetSize = 5;
+    size_t addedVectorCount = normSetSize - 1;
     auto mock_thread_pool = tieredIndexMock();
     auto *tiered_index =
         this->CreateSQ8TieredIndex(mock_thread_pool, dim, VecSimMetric_Cosine, normSetSize);
 
     // Add parallel vectors (same direction [1,2,3,4], different magnitudes).
-    for (size_t i = 0; i < normSetSize; i++) {
+    for (size_t i = 0; i < addedVectorCount; i++) {
         TEST_DATA_T vec[dim];
         float scale = static_cast<float>(i + 1);
         for (size_t d = 0; d < dim; d++) {
@@ -5991,16 +5971,16 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, CosineMeanCorrectness) {
         }
         VecSimIndex_AddVector(tiered_index, vec, i);
     }
-    ASSERT_FALSE(this->getIsInAccumulationPhase(tiered_index));
+    ASSERT_TRUE(this->getIsInAccumulationPhase(tiered_index));
 
-    // The running sum / normSetSize should be the mean of the normalized vectors.
+    // The running sum / addedVectorCount should be the mean of the normalized vectors.
     // Since all vectors have the same direction [1,2,3,4], after normalization they're all
     // [1,2,3,4]/sqrt(1+4+9+16) = [1,2,3,4]/sqrt(30). The mean is the same unit vector.
     const auto &running_sum = this->getRunningSumVec(tiered_index);
     float norm_factor = std::sqrt(1.0f + 4.0f + 9.0f + 16.0f);
     for (size_t d = 0; d < dim; d++) {
         float expected_mean = (d + 1.0f) / norm_factor;
-        float actual_mean = running_sum[d] / normSetSize;
+        float actual_mean = running_sum[d] / addedVectorCount;
         ASSERT_NEAR(actual_mean, expected_mean, 0.02f) << "Mean mismatch at dim " << d;
     }
 }

@@ -108,7 +108,7 @@ private:
 
     bool isQuantized{false};
     size_t quantNormalizationSetSize;
-    std::atomic_bool isInAccumulationPhase;
+    std::atomic<bool> isInAccumulationPhase;
 
     struct SQAccumulationState {
         vecsim_stl::vector<float> runningSumVec;
@@ -889,6 +889,7 @@ void TieredHNSWIndex<DataType, DistType>::updateQuantizedBackend() {
         }
 #endif
 
+        this->lockMainIndexGuard();
         // The backend is constructed with normalized frontend blobs, so cosine is resolved to IP.
         if (hnswParams.metric == VecSimMetric_L2) {
             this->getHNSWIndex()->replaceComponents(
@@ -899,6 +900,7 @@ void TieredHNSWIndex<DataType, DistType>::updateQuantizedBackend() {
                 CreateSQ8IndexComponents<DataType, VecSimMetric_IP>(this->allocator, hnswParams.dim,
                                                                     mean.data()));
         }
+        this->unlockMainIndexGuard();
         this->sqAccumulationState.reset();
     }
 }
@@ -1187,8 +1189,12 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSW_BatchIterator::TieredHNSW_BatchI
     : VecSimBatchIterator(nullptr, queryParams ? queryParams->timeoutCtx : nullptr,
                           std::move(allocator)),
       index(index), flat_results(this->allocator), hnsw_results(this->allocator),
-      flat_iterator(this->index->frontendIndex->newBatchIterator(query_vector, queryParams)),
-      hnsw_iterator(UNINITIALIZED), returned_results_set(this->allocator) {
+      flat_iterator(UNINITIALIZED), hnsw_iterator(UNINITIALIZED),
+      returned_results_set(this->allocator) {
+    this->index->flatIndexGuard.lock_shared();
+    this->flat_iterator = this->index->frontendIndex->newBatchIterator(query_vector, queryParams);
+    this->index->flatIndexGuard.unlock_shared();
+
     // Save a copy of the query params to initialize the HNSW iterator with (on first batch and
     // first batch after reset).
     if (queryParams) {

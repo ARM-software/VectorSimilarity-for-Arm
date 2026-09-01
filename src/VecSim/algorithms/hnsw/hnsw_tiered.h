@@ -108,7 +108,6 @@ private:
 
     bool isQuantized{false};
     size_t quantNormalizationSetSize;
-    std::atomic<bool> isInAccumulationPhase;
 
     struct SQAccumulationState {
         vecsim_stl::vector<float> runningSumVec;
@@ -283,7 +282,11 @@ public:
     int addVector(const void *blob, labelType label) override;
     int deleteVector(labelType label) override;
     size_t getNumMarkedDeleted() const override {
-        return this->getHNSWIndex()->getNumMarkedDeleted();
+        this->mainIndexGuard.lock_shared();
+        size_t num_marked_deleted =
+            this->backendIndex ? this->getHNSWIndex()->getNumMarkedDeleted() : 0;
+        this->mainIndexGuard.unlock_shared();
+        return num_marked_deleted;
     }
     size_t indexSize() const override;
     size_t indexCapacity() const override;
@@ -301,9 +304,19 @@ public:
             TieredHNSW_BatchIterator(queryBlob, this, queryParams, this->allocator);
     }
     inline void setLastSearchMode(VecSearchMode mode) override {
-        this->backendIndex->setLastSearchMode(mode);
+        this->mainIndexGuard.lock_shared();
+        if (this->backendIndex) {
+            this->backendIndex->setLastSearchMode(mode);
+        }
+        this->mainIndexGuard.unlock_shared();
     }
     void runGC() override {
+        this->mainIndexGuard.lock_shared();
+        if (!this->backendIndex) {
+            this->mainIndexGuard.unlock_shared();
+            return;
+        }
+        this->mainIndexGuard.unlock_shared();
         // Run no more than pendingSwapJobsThreshold value jobs.
         TIERED_LOG(VecSimCommonStrings::LOG_VERBOSE_STRING,
                    "running asynchronous GC for tiered HNSW index");
@@ -312,18 +325,24 @@ public:
     void acquireSharedLocks() override {
         this->flatIndexGuard.lock_shared();
         this->mainIndexGuard.lock_shared();
-        this->getHNSWIndex()->lockSharedIndexDataGuard();
+        if (this->backendIndex) {
+            this->getHNSWIndex()->lockSharedIndexDataGuard();
+        }
     }
 
     void releaseSharedLocks() override {
+        if (this->backendIndex) {
+            this->getHNSWIndex()->unlockSharedIndexDataGuard();
+        }
         this->flatIndexGuard.unlock_shared();
         this->mainIndexGuard.unlock_shared();
-        this->getHNSWIndex()->unlockSharedIndexDataGuard();
     }
 
     VecSimDebugCommandCode getHNSWElementNeighbors(size_t label, int ***neighborsData) {
         this->mainIndexGuard.lock_shared();
-        auto res = this->getHNSWIndex()->getHNSWElementNeighbors(label, neighborsData);
+        auto res = this->backendIndex
+                       ? this->getHNSWIndex()->getHNSWElementNeighbors(label, neighborsData)
+                       : VecSimDebugCommandCode_LabelNotExists;
         this->mainIndexGuard.unlock_shared();
         return res;
     }
@@ -331,8 +350,11 @@ public:
 #ifdef BUILD_TESTS
     void getDataByLabel(labelType label, std::vector<std::vector<DataType>> &vectors_output) const;
     size_t indexMetaDataCapacity() const override {
-        return this->backendIndex->indexMetaDataCapacity() +
-               this->frontendIndex->indexMetaDataCapacity();
+        this->mainIndexGuard.lock_shared();
+        size_t backend_capacity =
+            this->backendIndex ? this->backendIndex->indexMetaDataCapacity() : 0;
+        this->mainIndexGuard.unlock_shared();
+        return backend_capacity + this->frontendIndex->indexMetaDataCapacity();
     }
 #endif
 };
@@ -779,7 +801,7 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSWIndex(HNSWIndex<DataType, DistTyp
     : VecSimTieredIndex<DataType, DistType>(hnsw_index, bf_index, tiered_index_params, allocator),
       labelToInsertJobs(this->allocator), idToRepairJobs(this->allocator),
       idToSwapJob(this->allocator), invalidJobs(this->allocator), currInvalidJobId(0),
-      readySwapJobs(0), quantNormalizationSetSize(0), isInAccumulationPhase(false) {
+      readySwapJobs(0), quantNormalizationSetSize(0) {
     // If the param for swapJobThreshold is 0 use the default value, if it exceeds the maximum
     // allowed, use the maximum value.
     this->pendingSwapJobsThreshold =
@@ -796,7 +818,6 @@ TieredHNSWIndex<DataType, DistType>::TieredHNSWIndex(HNSWIndex<DataType, DistTyp
             tiered_index_params.specificParams.tieredHnswParams.QuantNormalizationSetSize;
         if (normSize > 0) {
             this->quantNormalizationSetSize = std::min(normSize, MAX_QUANT_NORMALIZATION_SET_SIZE);
-            this->isInAccumulationPhase.store(true, std::memory_order_relaxed);
             this->sqAccumulationState.emplace(this->allocator,
                                               *tiered_index_params.primaryIndexParams);
             this->sqAccumulationState->runningSumVec.resize(hnswParams.dim, 0.0f);
@@ -834,16 +855,19 @@ TieredHNSWIndex<DataType, DistType>::topKQuery(const void *queryBlob, size_t k,
                                                VecSimQueryParams *queryParams) const {
     // Accumulation phase: backend is an empty placeholder. We can short-circuit
     // to a flat-only query.
-    if (this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+    this->mainIndexGuard.lock_shared();
+    if (!this->backendIndex) {
+        this->mainIndexGuard.unlock_shared();
         this->flatIndexGuard.lock_shared();
         auto *res = this->frontendIndex->topKQuery(queryBlob, k, queryParams);
         this->flatIndexGuard.unlock_shared();
         return res;
     }
+    this->mainIndexGuard.unlock_shared();
     // For quantized tiered, flat/backend scores are not directly comparable, so we
     // must use withSet=true even for single-value indexes. Multi-value already
     // uses withSet=true in the base.
-    if (isQuantized && !this->backendIndex->isMultiValue()) {
+    if (isQuantized && !this->frontendIndex->isMultiValue()) {
         return this->template topKQueryImp<true>(queryBlob, k, queryParams);
     }
     return VecSimTieredIndex<DataType, DistType>::topKQuery(queryBlob, k, queryParams);
@@ -854,7 +878,9 @@ VecSimQueryReply *
 TieredHNSWIndex<DataType, DistType>::rangeQuery(const void *queryBlob, double radius,
                                                 VecSimQueryParams *queryParams,
                                                 VecSimQueryReply_Order order) const {
-    if (this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+    this->mainIndexGuard.lock_shared();
+    if (!this->backendIndex) {
+        this->mainIndexGuard.unlock_shared();
         this->flatIndexGuard.lock_shared();
         auto *res = this->frontendIndex->rangeQuery(queryBlob, radius, queryParams);
         this->flatIndexGuard.unlock_shared();
@@ -863,7 +889,8 @@ TieredHNSWIndex<DataType, DistType>::rangeQuery(const void *queryBlob, double ra
         }
         return res;
     }
-    if (isQuantized && !this->backendIndex->isMultiValue()) {
+    this->mainIndexGuard.unlock_shared();
+    if (isQuantized && !this->frontendIndex->isMultiValue()) {
         return this->template rangeQueryImp<true>(queryBlob, radius, queryParams, order);
     }
     return VecSimTieredIndex<DataType, DistType>::rangeQuery(queryBlob, radius, queryParams, order);
@@ -883,6 +910,10 @@ void TieredHNSWIndex<DataType, DistType>::updateQuantizedBackend() {
             mean[i] = accumulationState.runningSumVec[i] / this->quantNormalizationSetSize;
         }
 
+        hnswParams.quantParams = mean.data();
+        auto *new_backend = reinterpret_cast<HNSWIndex<DataType, DistType> *>(
+            HNSWFactory::NewIndex(&accumulationState.backendIndexParams, true));
+
 #ifdef BUILD_TESTS
         if (beforeQuantizedBackendReplacement) {
             beforeQuantizedBackendReplacement();
@@ -890,16 +921,7 @@ void TieredHNSWIndex<DataType, DistType>::updateQuantizedBackend() {
 #endif
 
         this->lockMainIndexGuard();
-        // The backend is constructed with normalized frontend blobs, so cosine is resolved to IP.
-        if (hnswParams.metric == VecSimMetric_L2) {
-            this->getHNSWIndex()->replaceComponents(
-                CreateSQ8IndexComponents<DataType, VecSimMetric_L2>(this->allocator, hnswParams.dim,
-                                                                    mean.data()));
-        } else {
-            this->getHNSWIndex()->replaceComponents(
-                CreateSQ8IndexComponents<DataType, VecSimMetric_IP>(this->allocator, hnswParams.dim,
-                                                                    mean.data()));
-        }
+        this->backendIndex = new_backend;
         this->unlockMainIndexGuard();
         this->sqAccumulationState.reset();
     }
@@ -908,16 +930,24 @@ void TieredHNSWIndex<DataType, DistType>::updateQuantizedBackend() {
 template <typename DataType, typename DistType>
 size_t TieredHNSWIndex<DataType, DistType>::indexSize() const {
     this->flatIndexGuard.lock_shared();
-    this->getHNSWIndex()->lockSharedIndexDataGuard();
-    size_t res = this->backendIndex->indexSize() + this->frontendIndex->indexSize();
-    this->getHNSWIndex()->unlockSharedIndexDataGuard();
+    size_t res = this->frontendIndex->indexSize();
+    this->mainIndexGuard.lock_shared();
+    if (this->backendIndex) {
+        this->getHNSWIndex()->lockSharedIndexDataGuard();
+        res += this->backendIndex->indexSize();
+        this->getHNSWIndex()->unlockSharedIndexDataGuard();
+    }
+    this->mainIndexGuard.unlock_shared();
     this->flatIndexGuard.unlock_shared();
     return res;
 }
 
 template <typename DataType, typename DistType>
 size_t TieredHNSWIndex<DataType, DistType>::indexCapacity() const {
-    return this->backendIndex->indexCapacity() + this->frontendIndex->indexCapacity();
+    this->mainIndexGuard.lock_shared();
+    size_t backend_capacity = this->backendIndex ? this->backendIndex->indexCapacity() : 0;
+    this->mainIndexGuard.unlock_shared();
+    return backend_capacity + this->frontendIndex->indexCapacity();
 }
 
 // In the tiered index, we assume that the blobs are processed by the flat buffer
@@ -932,8 +962,7 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     // writeMode is not protected since it is assumed to be called only from the "main thread"
     // (that is the thread that is exclusively calling add/delete vector).
     // VecSim_WriteInPlace is ignored during the accumulation phase
-    if (!this->isInAccumulationPhase.load(std::memory_order_acquire) &&
-        this->getWriteMode() == VecSim_WriteInPlace) {
+    if (hnsw_index && this->getWriteMode() == VecSim_WriteInPlace) {
         // First, check if we need to overwrite the vector in-place for single (from both indexes).
         if (!this->backendIndex->isMultiValue()) {
             ret -= this->deleteVector(label);
@@ -951,8 +980,7 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
         ++this->directHNSWInsertions;
         return ret;
     }
-    if (!this->isInAccumulationPhase.load(std::memory_order_acquire) &&
-        this->frontendIndex->indexSize() >= this->flatBufferLimit) {
+    if (hnsw_index && this->frontendIndex->indexSize() >= this->flatBufferLimit) {
         // Handle overwrite situation.
         if (!this->backendIndex->isMultiValue()) {
             // This will do nothing (and return 0) if this label doesn't exist. Otherwise, it may
@@ -979,7 +1007,7 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     if (this->frontendIndex->isLabelExists(label) && !this->frontendIndex->isMultiValue()) {
         // Overwrite the vector and invalidate its only pending job (since we are not in MULTI).
         auto *old_job = this->labelToInsertJobs.at(label).at(0);
-        if (this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+        if (!hnsw_index) {
             const DataType *vector_data = this->frontendIndex->getDataByInternalId(old_job->id);
             this->subtractFromSum(vector_data);
         }
@@ -996,7 +1024,7 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     }
     // If this label already exists, this will do overwrite.
     this->frontendIndex->addVector(blob, label);
-    if (this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+    if (!hnsw_index) {
         this->addToSum(this->frontendIndex->getDataByInternalId(new_flat_id));
     }
 
@@ -1006,7 +1034,7 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     if (this->labelToInsertJobs.find(label) != this->labelToInsertJobs.end()) {
         // There's already a pending insert job for this label, add another one (without overwrite,
         // only possible in multi index)
-        assert(this->backendIndex->isMultiValue());
+        assert(this->frontendIndex->isMultiValue());
         this->labelToInsertJobs.at(label).push_back((HNSWInsertJob *)new_insert_job);
     } else {
         vecsim_stl::vector<HNSWInsertJob *> new_jobs_vec(1, (HNSWInsertJob *)new_insert_job,
@@ -1018,8 +1046,7 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
     // Here, a worker might ingest the previous vector that was stored under "label"
     // (in case of override in non-MULTI index) - so if it's there, we remove it (and create the
     // required repair jobs), *before* we submit the insert job.
-    if (!this->isInAccumulationPhase.load(std::memory_order_acquire) &&
-        !this->backendIndex->isMultiValue()) {
+    if (hnsw_index && !this->backendIndex->isMultiValue()) {
         // If we removed the previous vector from both HNSW and flat in the overwrite process,
         // we still return 0 (not -1).
         ret = std::max(ret - this->deleteLabelFromHNSW(label), 0);
@@ -1033,14 +1060,13 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
         this->executeReadySwapJobs(this->pendingSwapJobsThreshold);
     }
 
-    if (!this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+    if (hnsw_index) {
         // Insert job to the queue and signal the workers' updater.
         this->submitSingleJob(new_insert_job);
     } else if (this->frontendIndex->indexSize() >= this->quantNormalizationSetSize) {
         // If we are in the accumulation phase and we just reached the quantization set size, we
         // can update the backend index with accumulated mean and transition to the regular mode.
         this->updateQuantizedBackend();
-        this->isInAccumulationPhase.store(false, std::memory_order_release);
 
         // Submit all pending insert jobs to the job queue.
         vecsim_stl::vector<AsyncJob *> jobs(this->allocator);
@@ -1067,7 +1093,7 @@ int TieredHNSWIndex<DataType, DistType>::deleteVector(labelType label) {
             // Invalidate the pending insert job(s) into HNSW associated with this label
             auto &insert_jobs = this->labelToInsertJobs.at(label);
             for (auto *job : insert_jobs) {
-                if (this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+                if (!this->backendIndex) {
                     const DataType *vector_data = this->frontendIndex->getDataByInternalId(job->id);
                     this->subtractFromSum(vector_data);
                 }
@@ -1092,7 +1118,7 @@ int TieredHNSWIndex<DataType, DistType>::deleteVector(labelType label) {
         this->flatIndexGuard.unlock_shared();
     }
 
-    if (this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+    if (!this->backendIndex) {
         return num_deleted_vectors;
     }
 
@@ -1147,7 +1173,7 @@ double TieredHNSWIndex<DataType, DistType>::getDistanceFrom_Unsafe(labelType lab
     // If the label doesn't exist, the distance will be NaN.
     auto flat_dist = this->frontendIndex->getDistanceFrom_Unsafe(label, blob);
 
-    if (this->isInAccumulationPhase.load(std::memory_order_acquire)) {
+    if (!this->backendIndex) {
         return flat_dist;
     }
 
@@ -1224,7 +1250,7 @@ template <typename DataType, typename DistType>
 VecSimQueryReply *TieredHNSWIndex<DataType, DistType>::TieredHNSW_BatchIterator::getNextResults(
     size_t n_res, VecSimQueryReply_Order order) {
 
-    const bool isMulti = this->index->backendIndex->isMultiValue();
+    const bool isMulti = this->index->frontendIndex->isMultiValue();
     const bool needsDedup = isMulti || this->index->isQuantized;
     auto hnsw_code = VecSim_QueryReply_OK;
 
@@ -1243,16 +1269,20 @@ VecSimQueryReply *TieredHNSWIndex<DataType, DistType>::TieredHNSW_BatchIterator:
         // We also take the lock on the main index on the first call to getNextResults, and we hold
         // it until the iterator is depleted or freed.
         this->index->mainIndexGuard.lock_shared();
-        this->hnsw_iterator = this->index->backendIndex->newBatchIterator(
-            this->flat_iterator->getQueryBlob(), queryParams);
-        auto cur_hnsw_results = this->hnsw_iterator->getNextResults(n_res, BY_SCORE_THEN_ID);
-        hnsw_code = cur_hnsw_results->code;
-        this->hnsw_results.swap(cur_hnsw_results->results);
-        VecSimQueryReply_Free(cur_hnsw_results);
-        if (this->hnsw_iterator->isDepleted()) {
-            delete this->hnsw_iterator;
-            this->hnsw_iterator = DEPLETED;
+        if (!this->index->backendIndex) {
             this->index->mainIndexGuard.unlock_shared();
+        } else {
+            this->hnsw_iterator = this->index->backendIndex->newBatchIterator(
+                this->flat_iterator->getQueryBlob(), queryParams);
+            auto cur_hnsw_results = this->hnsw_iterator->getNextResults(n_res, BY_SCORE_THEN_ID);
+            hnsw_code = cur_hnsw_results->code;
+            this->hnsw_results.swap(cur_hnsw_results->results);
+            VecSimQueryReply_Free(cur_hnsw_results);
+            if (this->hnsw_iterator->isDepleted()) {
+                delete this->hnsw_iterator;
+                this->hnsw_iterator = DEPLETED;
+                this->index->mainIndexGuard.unlock_shared();
+            }
         }
     } else {
         while (this->flat_results.size() < n_res && !this->flat_iterator->isDepleted()) {
@@ -1454,7 +1484,7 @@ VecSimDebugInfoIterator *TieredHNSWIndex<DataType, DistType>::debugInfoIterator(
 
 template <typename DataType, typename DistType>
 VecSimIndexBasicInfo TieredHNSWIndex<DataType, DistType>::basicInfo() const {
-    VecSimIndexBasicInfo info = this->backendIndex->getBasicInfo();
+    VecSimIndexBasicInfo info = this->frontendIndex->getBasicInfo();
     info.isTiered = true;
     info.algo = VecSimAlgo_HNSWLIB;
     return info;

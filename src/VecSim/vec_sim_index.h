@@ -234,27 +234,6 @@ public:
     inline auto getQueryAlignment() const { return this->preprocessors->getQueryAlignment(); }
     inline auto getStorageAlignment() const { return this->preprocessors->getStorageAlignment(); }
 
-    void replaceComponents(const IndexComponents<DataType, DistType> &components) {
-        assert(components.indexCalculator != nullptr);
-        assert(components.preprocessors != nullptr);
-        assert(components.indexCalculator != this->indexCalculator);
-        assert(components.preprocessors != this->preprocessors);
-
-        auto newStoredDistanceDispatch =
-            components.indexCalculator->getDistanceDispatch(DistanceMode::StoredToStored);
-        auto newQueryDistanceDispatch =
-            components.indexCalculator->getDistanceDispatch(DistanceMode::StoredToQuery);
-        assert(newStoredDistanceDispatch.isValid());
-        assert(newQueryDistanceDispatch.isValid());
-
-        delete this->indexCalculator;
-        delete this->preprocessors;
-        this->indexCalculator = components.indexCalculator;
-        this->storedDistanceDispatch = newStoredDistanceDispatch;
-        this->queryDistanceDispatch = newQueryDistanceDispatch;
-        this->preprocessors = components.preprocessors;
-    }
-
     virtual inline VecSimIndexStatsInfo statisticInfo() const override {
         return VecSimIndexStatsInfo{
             .memory = this->getAllocationSize(),

@@ -41,23 +41,37 @@ static inline BFParams NewBFParams(const TieredIndexParams *params) {
 template <typename DataType, typename DistType = DataType>
 inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
 
-    VecSimParams backend_params = *params->primaryIndexParams;
-    auto &hnsw_params = backend_params.algoParams.hnswParams;
-    std::vector<float> zero_mean;
-    if (hnsw_params.quantType != VecSimQuant_NONE &&
-        params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0) {
-        // Construct an SQ8 with norm backend by setting quantParams to not NULL
-        // Components are replaced with the accumulated mean before jobs are submitted.
-        zero_mean.resize(hnsw_params.dim, 0.0f);
-        hnsw_params.quantParams = zero_mean.data();
+    const auto &hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
+    bool defer_backend = false;
+
+    if (hnsw_params.quantType != VecSimQuant_NONE) {
+        constexpr bool supports_quantization =
+            std::is_same_v<DistType, float> &&
+            (std::is_same_v<DataType, float> || std::is_same_v<DataType, float16>);
+
+        if (!supports_quantization || hnsw_params.quantType != VecSimQuant_SQ8) {
+            return nullptr;
+        }
+
+        const bool with_norm =
+            params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0;
+        const bool supports_with_norm =
+            !(std::is_same_v<DataType, float16> && hnsw_params.metric == VecSimMetric_L2);
+
+        if (with_norm) {
+            if (!supports_with_norm) {
+                return nullptr;
+            } else {
+                defer_backend = true;
+            }
+        }
     }
 
-    // Normalization is done by the frontend index.
-    auto *hnsw_index = reinterpret_cast<HNSWIndex<DataType, DistType> *>(
-        HNSWFactory::NewIndex(&backend_params, true));
-    if (!hnsw_index) {
-        // Unsupported SQ8 parameters will be rejected by the HNSWFactory::NewIndex
-        return nullptr;
+    HNSWIndex<DataType, DistType> *hnsw_index = nullptr;
+    if (!defer_backend) {
+        // Normalization is done by the frontend index.
+        hnsw_index = reinterpret_cast<HNSWIndex<DataType, DistType> *>(
+            HNSWFactory::NewIndex(params->primaryIndexParams, true));
     }
 
     // initialize brute force index
@@ -65,9 +79,11 @@ inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
 
     AbstractIndexInitParams abstractInitParams =
         VecSimFactory::NewAbstractInitParams(&bf_params, params->primaryIndexParams->logCtx, false);
-    assert(hnsw_index->getInputBlobSize() == abstractInitParams.storedDataSize);
-    if (hnsw_params.quantType == VecSimQuant_NONE) {
-        assert(hnsw_index->getStoredDataSize() == abstractInitParams.storedDataSize);
+    if (hnsw_index) {
+        assert(hnsw_index->getInputBlobSize() == abstractInitParams.storedDataSize);
+        if (hnsw_params.quantType == VecSimQuant_NONE) {
+            assert(hnsw_index->getStoredDataSize() == abstractInitParams.storedDataSize);
+        }
     }
     auto frontendIndex = static_cast<BruteForceIndex<DataType, DistType> *>(
         BruteForceFactory::NewIndex(&bf_params, abstractInitParams, false));
@@ -82,25 +98,22 @@ inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
 
 inline size_t EstimateInitialSize(const TieredIndexParams *params) {
     HNSWParams hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
-    VecSimQuantType quantType = hnsw_params.quantType;
-    size_t normSize = params->specificParams.tieredHnswParams.QuantNormalizationSetSize;
 
     size_t est = 0;
+    size_t est_backend = HNSWFactory::EstimateInitialSize(&hnsw_params, true);
     size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
 
-    std::vector<float> zero_mean;
-    if (quantType != VecSimQuant_NONE && normSize > 0) {
+    const bool defer_backend =
+        hnsw_params.quantType != VecSimQuant_NONE &&
+        params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0;
+    if (defer_backend) {
         // Add size of SQ accumulation buffer
         est += allocations_overhead + hnsw_params.dim * sizeof(float);
-
-        // Set quantParams non-null to indicate HNSW SQ8 with_norm index
-        static char dummy;
-        hnsw_params.quantParams = &dummy;
+    } else {
+        // Add size estimation of VecSimTieredIndex sub indexes.
+        // Normalization is done by the frontend index.
+        est += est_backend;
     }
-
-    // Add size estimation of VecSimTieredIndex sub indexes.
-    // Normalization is done by the frontend index.
-    est += HNSWFactory::EstimateInitialSize(&hnsw_params, true);
 
     // Management layer allocator overhead.
     est += sizeof(VecSimAllocator) + allocations_overhead;

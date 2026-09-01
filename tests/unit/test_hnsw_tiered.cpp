@@ -4658,7 +4658,7 @@ protected:
     // --- Accessor helpers (HNSWTieredIndexTestSQ8 is a friend of TieredHNSWIndex) ---
 
     bool getIsInAccumulationPhase(TieredHNSWIndex<data_t, dist_t> *idx) {
-        return idx->isInAccumulationPhase;
+        return !idx->backendIndex;
     }
 
     const vecsim_stl::vector<float> &getRunningSumVec(TieredHNSWIndex<data_t, dist_t> *idx) {
@@ -4759,8 +4759,8 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, AccumulationPhaseInitialization) {
         ASSERT_FLOAT_EQ(this->getRunningSumVec(tiered_index)[i], 0.0f);
     }
 
-    // Backend index exists but should be empty.
-    ASSERT_EQ(this->getBackendIndex(tiered_index)->indexSize(), 0);
+    // Backend is not published until accumulation completes.
+    ASSERT_EQ(this->getBackendIndex(tiered_index), nullptr);
     ASSERT_EQ(this->getFrontendIndex(tiered_index)->indexSize(), 0);
     ASSERT_EQ(tiered_index->indexSize(), 0);
 }
@@ -4813,7 +4813,7 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, QueryDuringAccumulation) {
 
     ASSERT_TRUE(this->getIsInAccumulationPhase(tiered_index));
     ASSERT_EQ(this->getFrontendIndex(tiered_index)->indexSize(), n);
-    ASSERT_EQ(this->getBackendIndex(tiered_index)->indexSize(), 0);
+    ASSERT_EQ(this->getBackendIndex(tiered_index), nullptr);
 
     // Run TopK query.
     TEST_DATA_T query[dim];
@@ -4872,7 +4872,7 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, AddVectorDuringAccumulation) {
 
     // Vector should be in flat buffer.
     ASSERT_EQ(this->getFrontendIndex(tiered_index)->indexSize(), 1);
-    ASSERT_EQ(this->getBackendIndex(tiered_index)->indexSize(), 0);
+    ASSERT_EQ(this->getBackendIndex(tiered_index), nullptr);
     ASSERT_EQ(tiered_index->indexSize(), 1);
 
     // Job should be created in labelToInsertJobs but NOT submitted to queue.
@@ -4887,6 +4887,7 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, DeleteVectorDuringAccumulation) {
     auto mock_thread_pool = tieredIndexMock();
     auto *tiered_index =
         this->CreateSQ8TieredIndex(mock_thread_pool, dim, VecSimMetric_IP, normSetSize);
+    ASSERT_EQ(this->getBackendIndex(tiered_index), nullptr);
 
     // Add two vectors.
     TEST_DATA_T vec1[dim], vec2[dim];
@@ -4974,6 +4975,7 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, BackendCreatedAtThreshold) {
     ASSERT_FALSE(this->getIsInAccumulationPhase(tiered_index));
     ASSERT_FALSE(this->hasSQAccumulationState(tiered_index));
     // Backend should be initialized (still empty since jobs haven't run).
+    ASSERT_NE(this->getBackendIndex(tiered_index), nullptr);
     ASSERT_EQ(this->getBackendIndex(tiered_index)->indexSize(), 0);
     // Flat buffer should hold all vectors.
     ASSERT_EQ(this->getFrontendIndex(tiered_index)->indexSize(), normSetSize);
@@ -5178,7 +5180,7 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, IndexSizeDuringAccumulation) {
     ASSERT_TRUE(this->getIsInAccumulationPhase(tiered_index));
     ASSERT_EQ(tiered_index->indexSize(), 10);
     ASSERT_EQ(this->getFrontendIndex(tiered_index)->indexSize(), 10);
-    ASSERT_EQ(this->getBackendIndex(tiered_index)->indexSize(), 0);
+    ASSERT_EQ(this->getBackendIndex(tiered_index), nullptr);
 }
 
 TYPED_TEST(HNSWTieredIndexTestSQ8, CapacityDuringAccumulation) {
@@ -5389,7 +5391,7 @@ TYPED_TEST(HNSWTieredIndexTestSQ8, WriteInPlaceDuringAccumulation) {
     // During accumulation, WriteInPlace is ignored - vector goes to flat buffer.
     ASSERT_TRUE(this->getIsInAccumulationPhase(tiered_index));
     ASSERT_EQ(this->getFrontendIndex(tiered_index)->indexSize(), 1);
-    ASSERT_EQ(this->getBackendIndex(tiered_index)->indexSize(), 0);
+    ASSERT_EQ(this->getBackendIndex(tiered_index), nullptr);
 }
 
 TYPED_TEST(HNSWTieredIndexTestSQ8, WriteInPlaceAfterAccumulation) {

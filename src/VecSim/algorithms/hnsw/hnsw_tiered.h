@@ -15,7 +15,6 @@
 #include <optional>
 
 #include "VecSim/algorithms/brute_force/brute_force_single.h"
-#include "VecSim/index_factories/components/components_factory.h"
 #include "VecSim/vec_sim_tiered_index.h"
 #include "hnsw.h"
 #include "VecSim/index_factories/hnsw_factory.h"
@@ -123,7 +122,7 @@ private:
     std::function<void()> afterBackendInsertBeforeFlatRemoval;
 #endif
 
-    void updateQuantizedBackend();
+    void initializeQuantizedBackend();
 
     void executeInsertJob(HNSWInsertJob *job);
     void executeRepairJob(HNSWRepairJob *job);
@@ -853,7 +852,7 @@ template <typename DataType, typename DistType>
 VecSimQueryReply *
 TieredHNSWIndex<DataType, DistType>::topKQuery(const void *queryBlob, size_t k,
                                                VecSimQueryParams *queryParams) const {
-    // Accumulation phase: backend is an empty placeholder. We can short-circuit
+    // Accumulation phase: backend is nullptr. We can short-circuit
     // to a flat-only query.
     this->mainIndexGuard.lock_shared();
     if (!this->backendIndex) {
@@ -897,7 +896,7 @@ TieredHNSWIndex<DataType, DistType>::rangeQuery(const void *queryBlob, double ra
 }
 
 template <typename DataType, typename DistType>
-void TieredHNSWIndex<DataType, DistType>::updateQuantizedBackend() {
+void TieredHNSWIndex<DataType, DistType>::initializeQuantizedBackend() {
     if constexpr (!std::is_same_v<DistType, float> ||
                   !(std::is_same_v<DataType, float> ||
                     std::is_same_v<DataType, vecsim_types::float16>)) {
@@ -1065,8 +1064,8 @@ int TieredHNSWIndex<DataType, DistType>::addVector(const void *blob, labelType l
         this->submitSingleJob(new_insert_job);
     } else if (this->frontendIndex->indexSize() >= this->quantNormalizationSetSize) {
         // If we are in the accumulation phase and we just reached the quantization set size, we
-        // can update the backend index with accumulated mean and transition to the regular mode.
-        this->updateQuantizedBackend();
+        // can initalize the backend index with accumulated mean and transition to the regular mode.
+        this->initializeQuantizedBackend();
 
         // Submit all pending insert jobs to the job queue.
         vecsim_stl::vector<AsyncJob *> jobs(this->allocator);

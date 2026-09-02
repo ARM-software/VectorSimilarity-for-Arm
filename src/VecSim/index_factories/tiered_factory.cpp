@@ -74,7 +74,6 @@ inline VecSimIndex *NewIndex(const TieredIndexParams *params) {
             HNSWFactory::NewIndex(params->primaryIndexParams, true));
     }
 
-    // initialize brute force index
     BFParams bf_params = NewBFParams(params);
 
     AbstractIndexInitParams abstractInitParams =
@@ -100,12 +99,22 @@ inline size_t EstimateInitialSize(const TieredIndexParams *params) {
     HNSWParams hnsw_params = params->primaryIndexParams->algoParams.hnswParams;
 
     size_t est = 0;
-    size_t est_backend = HNSWFactory::EstimateInitialSize(&hnsw_params, true);
-    size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
 
     const bool defer_backend =
         hnsw_params.quantType != VecSimQuant_NONE &&
         params->specificParams.tieredHnswParams.QuantNormalizationSetSize > 0;
+
+    if (defer_backend) {
+        // Set quantParams non-null to indicate HNSW SQ8 with_norm index
+        static char dummy;
+        hnsw_params.quantParams = &dummy;
+    }
+
+    // HNSWFactory::EstimateInitialSize will throw if the parameters are invalid
+    size_t est_backend = HNSWFactory::EstimateInitialSize(&hnsw_params, true);
+
+    size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
+
     if (defer_backend) {
         // Add size of SQ accumulation buffer
         est += allocations_overhead + hnsw_params.dim * sizeof(float);

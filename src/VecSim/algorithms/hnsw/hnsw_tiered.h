@@ -854,15 +854,16 @@ TieredHNSWIndex<DataType, DistType>::topKQuery(const void *queryBlob, size_t k,
                                                VecSimQueryParams *queryParams) const {
     // Accumulation phase: backend is nullptr. We can short-circuit
     // to a flat-only query.
+    this->flatIndexGuard.lock_shared();
     this->mainIndexGuard.lock_shared();
     if (!this->backendIndex) {
         this->mainIndexGuard.unlock_shared();
-        this->flatIndexGuard.lock_shared();
         auto *res = this->frontendIndex->topKQuery(queryBlob, k, queryParams);
         this->flatIndexGuard.unlock_shared();
         return res;
     }
     this->mainIndexGuard.unlock_shared();
+    this->flatIndexGuard.unlock_shared();
     // For quantized tiered, flat/backend scores are not directly comparable, so we
     // must use withSet=true even for single-value indexes. Multi-value already
     // uses withSet=true in the base.
@@ -877,10 +878,10 @@ VecSimQueryReply *
 TieredHNSWIndex<DataType, DistType>::rangeQuery(const void *queryBlob, double radius,
                                                 VecSimQueryParams *queryParams,
                                                 VecSimQueryReply_Order order) const {
+    this->flatIndexGuard.lock_shared();
     this->mainIndexGuard.lock_shared();
     if (!this->backendIndex) {
         this->mainIndexGuard.unlock_shared();
-        this->flatIndexGuard.lock_shared();
         auto *res = this->frontendIndex->rangeQuery(queryBlob, radius, queryParams);
         this->flatIndexGuard.unlock_shared();
         if (res) {
@@ -889,6 +890,7 @@ TieredHNSWIndex<DataType, DistType>::rangeQuery(const void *queryBlob, double ra
         return res;
     }
     this->mainIndexGuard.unlock_shared();
+    this->flatIndexGuard.unlock_shared();
     if (isQuantized && !this->frontendIndex->isMultiValue()) {
         return this->template rangeQueryImp<true>(queryBlob, radius, queryParams, order);
     }

@@ -9,6 +9,7 @@
 
 #include "gtest/gtest.h"
 #include "VecSim/algorithms/hnsw/hnsw_single.h"
+#include "VecSim/index_factories/hnsw_factory.h"
 #include "VecSim/types/float16.h"
 #include "VecSim/types/sq8.h"
 #include "VecSim/vec_sim.h"
@@ -17,6 +18,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -181,6 +183,55 @@ TYPED_TEST(HNSWSQ8Test, getDataByLabelReportsNothingForQuantizedStorageLargeDim)
 }
 
 TYPED_TEST(HNSWSQ8Test, CreateIndex) { this->create_index_test(); }
+
+TYPED_TEST(HNSWSQ8Test, SerializationRoundTripV5) {
+    using data_t = typename TestFixture::data_t;
+    constexpr size_t dim = 8;
+    HNSWParams params = {.dim = dim, .metric = VecSimMetric_L2, .M = 8, .efConstruction = 40};
+    this->SetUp(params);
+
+    for (size_t i = 0; i < 3; ++i) {
+        ASSERT_EQ(this->GenerateAndAddVector(10 + i, 0.5f + static_cast<float>(i), 0.1f), 1);
+    }
+    auto *original = this->CastToHNSW();
+    ASSERT_NE(original, nullptr);
+
+    struct TemporaryFile {
+        std::string path;
+        ~TemporaryFile() { std::remove(path.c_str()); }
+    } file{::testing::TempDir() + "hnsw_sq8_" +
+           std::string(VecSimType_ToString(TypeParam::get_index_type())) +
+           (TypeParam::with_quant_params ? "_mean" : "_no_mean") + ".hnsw"};
+
+    original->saveIndex(file.path);
+    std::unique_ptr<VecSimIndex, decltype(&VecSimIndex_Free)> loaded(
+        HNSWFactory::NewIndex(file.path), VecSimIndex_Free);
+    ASSERT_NE(loaded, nullptr);
+    auto *restored = dynamic_cast<HNSWIndex<data_t, float> *>(loaded.get());
+    ASSERT_NE(restored, nullptr);
+    EXPECT_EQ(restored->getVersion(), HNSWSerializer::EncodingVersion::V5);
+    EXPECT_TRUE(restored->checkIntegrity().valid_state);
+    EXPECT_EQ(restored->quantType, VecSimQuant_SQ8);
+    EXPECT_TRUE(restored->usesQuantizedStorage());
+    EXPECT_EQ(restored->serializedMeanVector, this->quantization_mean);
+    EXPECT_EQ(restored->getStoredDataSize(), original->getStoredDataSize());
+    ASSERT_EQ(VecSimIndex_IndexSize(loaded.get()), VecSimIndex_IndexSize(this->index));
+
+    std::vector<data_t> query(dim);
+    this->GenerateVector(query.data(), 1.5f, 0.1f);
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(std::memcmp(original->getDataByInternalId(i), restored->getDataByInternalId(i),
+                              original->getStoredDataSize()),
+                  0);
+        EXPECT_FLOAT_EQ(VecSimIndex_GetDistanceFrom_Unsafe(loaded.get(), 10 + i, query.data()),
+                        VecSimIndex_GetDistanceFrom_Unsafe(this->index, 10 + i, query.data()));
+    }
+    auto verify = [&](size_t id, double score, size_t) {
+        EXPECT_EQ(id, 11u);
+        EXPECT_FLOAT_EQ(score, VecSimIndex_GetDistanceFrom_Unsafe(this->index, id, query.data()));
+    };
+    runTopKSearchTest(loaded.get(), query.data(), 1, verify);
+}
 
 TYPED_TEST(HNSWSQ8Test, RejectStandaloneCosine) {
     HNSWParams params = {.type = TypeParam::get_index_type(),
@@ -636,28 +687,6 @@ TEST(HNSWSQ8ParamsTest, MeanCenteredFP16L2BoundedValues) {
             }
         }
     }
-}
-
-// V4 cannot encode the quantization settings needed to reload an SQ8 index.
-TYPED_TEST(HNSWSQ8Test, RejectsSerialization) {
-    HNSWParams params = {.dim = 4, .initialCapacity = 1};
-    this->SetUp(params);
-    ASSERT_EQ(this->GenerateAndAddVector(0, 0.25f, 0.25f), 1);
-
-    const auto file_name = std::string(getenv("ROOT")) + "/tests/unit/sq8_should_not_be_written";
-    const std::string existing_contents = "existing snapshot";
-    {
-        std::ofstream output(file_name, std::ios::binary);
-        output.write(existing_contents.data(), existing_contents.size());
-    }
-
-    EXPECT_THROW(this->CastToHNSW()->saveIndex(file_name), std::runtime_error);
-
-    std::ifstream input(file_name, std::ios::binary);
-    const std::string saved_contents{std::istreambuf_iterator<char>(input),
-                                     std::istreambuf_iterator<char>()};
-    EXPECT_EQ(saved_contents, existing_contents);
-    std::remove(file_name.c_str());
 }
 
 // Exercise graph construction's stored-to-stored IP kernel with non-degenerate quantization ranges.
